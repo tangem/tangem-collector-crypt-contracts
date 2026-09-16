@@ -1,7 +1,7 @@
-// E2E spin: pay for a CC gacha spin FROM THE VAULT via open_pack
+// E2E spin: pay for a CC gacha spin FROM THE VAULT via purchase_pack
 // (inner CPI transfer + client-added top-level memo), prize to the vault PDA.
 // NB: this script follows the CURRENT IDL; if the devnet deployment predates
-// it (open_pack signature changed), redeploy before running.
+// it (purchase_pack signature changed), redeploy before running.
 //   NODE_PATH=$REPO/node_modules node scripts/devnet/vault_spin.js
 const {
   load, post, get, sleep, anchor, USDC, GACHA_USDC, MEMO_PROG, TOKEN_PROG, MPL_CORE_PROG,
@@ -13,16 +13,22 @@ const { getAssociatedTokenAddressSync, getAccount, createTransferCheckedInstruct
 async function main() {
   const { player, conn, provider, program, configPda, vaultPda, vaultUsdc, playerUsdc, feeUsdc } = load();
 
-  // top up the vault to >= 252.5 + headroom
-  let vBal = Number((await getAccount(conn, vaultUsdc)).amount) / 1e6;
-  if (vBal < 260) {
-    const need = BigInt(Math.ceil((260 - vBal) * 1e6));
+  // Tangem fee: the backend picks the machine's rate inside the on-chain
+  // corridor [min_fee_bps, max_fee_bps]; here we charge the floor rate.
+  const cfg = await program.account.config.fetch(configPda);
+  const feeAmount = new anchor.BN(AMOUNT).muln(cfg.minFeeBps).divn(10_000);
+  console.log(`fee_amount=${feeAmount.toString()} (min_fee_bps=${cfg.minFeeBps}, max_fee_bps=${cfg.maxFeeBps})`);
+
+  // top up the vault to >= AMOUNT + fee + headroom (raw units)
+  const target = BigInt(AMOUNT) + BigInt(feeAmount.toString()) + 5_000_000n;
+  let vRaw = (await getAccount(conn, vaultUsdc)).amount;
+  if (vRaw < target) {
     const tx = new Transaction().add(
-      createTransferCheckedInstruction(playerUsdc, USDC, vaultUsdc, player.publicKey, need, 6));
+      createTransferCheckedInstruction(playerUsdc, USDC, vaultUsdc, player.publicKey, target - vRaw, 6));
     await provider.sendAndConfirm(tx);
-    vBal = Number((await getAccount(conn, vaultUsdc)).amount) / 1e6;
+    vRaw = (await getAccount(conn, vaultUsdc)).amount;
   }
-  console.log(`vault USDC before: ${vBal}`);
+  console.log(`vault USDC before: ${Number(vRaw) / 1e6}`);
 
   console.log(`[1] generatePack ${PACK}: playerAddress=player, altPlayerAddress=vault PDA`);
   const gp = await post("generatePack", {
@@ -33,24 +39,24 @@ async function main() {
   if (!gp.json.transaction) { console.log("  failed:", JSON.stringify(gp.json)); return; }
   const memo = gp.json.memo;
   const onchainMemo = `${memo}:open`;
-  console.log(`  memo=${memo} (discarding CC's tx; paying from the VAULT via open_pack CPI)`);
+  console.log(`  memo=${memo} (discarding CC's tx; paying from the VAULT via purchase_pack CPI)`);
 
   const memoIx = new TransactionInstruction({ programId: MEMO_PROG, keys: [], data: Buffer.from(onchainMemo, "utf8") });
-  const openPackIx = await program.methods
-    .openPack(new anchor.BN(AMOUNT), onchainMemo)
+  const purchasePackIx = await program.methods
+    .purchasePack(new anchor.BN(AMOUNT), feeAmount, onchainMemo)
     .accountsPartial({
-      config: configPda, vault: vaultPda, hotDelegate: player.publicKey,
+      config: configPda, vault: vaultPda, sessionKey: player.publicKey,
       usdcMint: USDC, vaultUsdc, gachaUsdc: GACHA_USDC, feeUsdc,
       tokenProgram: TOKEN_PROG,
     })
     .instruction();
-  const tx = new Transaction().add(memoIx, openPackIx);
+  const tx = new Transaction().add(memoIx, purchasePackIx);
   tx.feePayer = player.publicKey;
   tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
   tx.sign(player);
   const sig = await conn.sendRawTransaction(tx.serialize());
   await conn.confirmTransaction(sig, "confirmed");
-  console.log(`[2] open_pack sig: ${sig}`);
+  console.log(`[2] purchase_pack sig: ${sig}`);
   console.log(`  vault USDC after: ${Number((await getAccount(conn, vaultUsdc)).amount) / 1e6}`);
 
   console.log(`[3] openPack {memo} — waiting for CC to credit the spin`);

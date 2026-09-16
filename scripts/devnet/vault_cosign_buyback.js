@@ -61,7 +61,7 @@ function validateBuybackTx(tx, { hotPubkey, vaultPda, vaultUsdc, programId }) {
       if (!kind) throw new Error(`ix[${i}]: program instruction is not a buyback`);
       const { price, memo } = decodeBuybackArgs(ix.data);
       const slots = SLOT[kind];
-      if (!ix.keys[slots.hot].pubkey.equals(hotPubkey)) throw new Error(`ix[${i}]: hot_delegate slot is not our hot key`);
+      if (!ix.keys[slots.hot].pubkey.equals(hotPubkey)) throw new Error(`ix[${i}]: session_key slot is not our hot key`);
       summary.kind = kind;
       summary.price = price;
       summary.memo = memo;

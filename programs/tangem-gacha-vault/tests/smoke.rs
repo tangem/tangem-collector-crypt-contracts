@@ -39,13 +39,13 @@ fn init_vault_ix(vault: Pubkey, cold: Pubkey, payer: Pubkey, hot: Pubkey, per: u
         program_id: PROGRAM_ID,
         accounts: accounts::InitVault {
             vault,
-            cold_owner: cold,
+            owner: cold,
             payer,
             system_program: system_program::ID,
         }
         .to_account_metas(None),
         data: instruction::InitVault {
-            hot_delegate: hot,
+            session_key: hot,
             per_spin_cap: per,
             daily_cap: daily,
         }
@@ -76,8 +76,8 @@ fn init_vault_executes_and_persists_state() {
     let acct = svm.get_account(&vault).expect("vault account created");
     assert_eq!(acct.owner, PROGRAM_ID);
     let v = Vault::try_deserialize(&mut acct.data.as_slice()).expect("deserialize Vault");
-    assert_eq!(v.cold_owner, cold.pubkey());
-    assert_eq!(v.hot_delegate, hot.pubkey());
+    assert_eq!(v.owner, cold.pubkey());
+    assert_eq!(v.session_key, hot.pubkey());
     assert_eq!(v.per_spin_cap, 300_000_000);
     assert_eq!(v.daily_cap, 1_000_000_000);
     assert_eq!(v.spent_today, 0);
@@ -119,7 +119,7 @@ fn init_vault_requires_cold_signature() {
 
     let (vault, _) = vault_pda(&cold.pubkey());
     let ix = init_vault_ix(vault, cold.pubkey(), payer.pubkey(), hot.pubkey(), 300_000_000, 1_000_000_000);
-    // Sign with payer only — cold_owner is a required Signer, so the SVM must
+    // Sign with payer only — owner is a required Signer, so the SVM must
     // reject it. (`new_signed_with_payer` would panic client-side with
     // NotEnoughSigners before reaching the SVM, hence partial_sign.)
     let msg = Message::new(&[ix], Some(&payer.pubkey()));
@@ -127,6 +127,6 @@ fn init_vault_requires_cold_signature() {
     tx.partial_sign(&[&payer], svm.latest_blockhash());
     assert!(
         svm.send_transaction(tx).is_err(),
-        "init_vault must require the cold_owner signature"
+        "init_vault must require the owner signature"
     );
 }

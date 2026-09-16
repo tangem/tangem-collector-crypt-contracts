@@ -4,7 +4,7 @@
 //   CC side   = the throwaway player key (config.gacha_wallet is temporarily
 //               swapped to it): builds the transaction per the builder
 //               contract, partially signs, exports base64;
-//   Tangem side = a freshly generated hot key (the vault's hot_delegate is
+//   Tangem side = a freshly generated hot key (the vault's session_key is
 //               temporarily rotated to it): the co-signer validates the
 //               whitelist, co-signs and submits — via the exact module
 //               functions of scripts/devnet/vault_cosign_buyback.js.
@@ -60,9 +60,9 @@ const coreOwner = (info) => new PublicKey(info.data.subarray(1, 33));
   try {
     // [1] Cold rotates the vault's hot key to hot2; admin swaps the config.
     await program.methods.updateVault(hot2.publicKey, null, null)
-      .accountsPartial({ vault: vaultPda, coldOwner: player.publicKey })
+      .accountsPartial({ vault: vaultPda, owner: player.publicKey })
       .signers([player]).rpc();
-    await program.methods.updateConfig(null, player.publicKey, null, null, null, null, null)
+    await program.methods.updateConfig(null, player.publicKey, null, null, null, null, null, null)
       .accountsPartial({ config: configPda, admin: player.publicKey })
       .signers([player]).rpc();
     console.log("[1] hot -> hot2; gacha_wallet -> throwaway");
@@ -85,7 +85,7 @@ const coreOwner = (info) => new PublicKey(info.data.subarray(1, 33));
     const buybackIx = await program.methods.buybackCore(PRICE, memo)
       .accountsPartial({
         config: configPda, vault: vaultPda,
-        hotDelegate: hot2.publicKey, ccAuthority: player.publicKey,
+        sessionKey: hot2.publicKey, ccAuthority: player.publicKey,
         destinationOwner: prizeWallet.publicKey,
         usdcMint: USDC, ccUsdc: playerUsdc, vaultUsdc,
         asset: ASSET, collection: COLLECTION,
@@ -142,14 +142,14 @@ const coreOwner = (info) => new PublicKey(info.data.subarray(1, 33));
     // [6] Restore BOTH: the hot key and the config — each in its own try.
     try {
       await program.methods.updateVault(player.publicKey, null, null)
-        .accountsPartial({ vault: vaultPda, coldOwner: player.publicKey })
+        .accountsPartial({ vault: vaultPda, owner: player.publicKey })
         .signers([player]).rpc();
       console.log("[6] hot restored to player");
     } catch (e) {
       console.error(`[6] HOT ROTATION RESTORE FAILED — vault hot is still hot2 (key in keys/last-hot2.json): ${e.message}`);
     }
     try {
-      await program.methods.updateConfig(null, GACHA_WALLET, null, null, null, null, null)
+      await program.methods.updateConfig(null, GACHA_WALLET, null, null, null, null, null, null)
         .accountsPartial({ config: configPda, admin: player.publicKey })
         .signers([player]).rpc();
       console.log("[6] gacha_wallet restored:", GACHA_WALLET.toBase58());

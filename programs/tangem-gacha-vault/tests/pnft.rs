@@ -92,9 +92,10 @@ fn write_config(svm: &mut LiteSVM, allow_buyback_delegation: bool, paused: bool)
         gacha_wallet: Pubkey::new_unique(),
         gacha_usdc_account: Pubkey::new_unique(),
         fee_usdc_account: Pubkey::new_unique(),
-        fee_bps: 0,
+        min_fee_bps: 0,
+        max_fee_bps: 1_000,
         paused,
-        _reserved: false,
+        _reserved: 0,
         allow_buyback_delegation,
         bump,
     };
@@ -165,13 +166,13 @@ fn setup(allow_buyback_delegation: bool) -> World {
         program_id: PROGRAM_ID,
         accounts: accounts::InitVault {
             vault,
-            cold_owner: cold.pubkey(),
+            owner: cold.pubkey(),
             payer: payer.pubkey(),
             system_program: system_program::ID,
         }
         .to_account_metas(None),
         data: instruction::InitVault {
-            hot_delegate: hot.pubkey(),
+            session_key: hot.pubkey(),
             per_spin_cap: 300_000_000,
             daily_cap: 1_000_000_000,
         }
@@ -348,7 +349,7 @@ fn approve_buyback_ix(w: &World, p: &Prize) -> Instruction {
         accounts: accounts::ApproveBuyback {
             config: w.config,
             vault: w.vault,
-            hot_delegate: w.hot.pubkey(),
+            session_key: w.hot.pubkey(),
             nft_mint: p.mint,
             nft_token: p.token,
             metadata: p.metadata,
@@ -519,7 +520,7 @@ fn approve_buyback_rejects_non_delegate_signer() {
         &[&attacker],
         w.svm.latest_blockhash(),
     );
-    // Anchor's has_one = hot_delegate constraint must reject the impostor.
+    // Anchor's has_one = session_key constraint must reject the impostor.
     assert_fails_with(&mut w, tx, "ConstraintHasOne", "attacker approve_buyback");
 }
 
@@ -645,7 +646,7 @@ fn buyback_transfer_by_delegate_then_clear_slot_and_gc() {
         program_id: PROGRAM_ID,
         accounts: accounts::CloseTokenAccountCtx {
             vault: w.vault,
-            cold_owner: w.cold.pubkey(),
+            owner: w.cold.pubkey(),
             token: p.token,
             token_program: TOKEN_PROGRAM_ID,
         }
@@ -696,7 +697,7 @@ fn buyback_transfer_by_delegate_then_clear_slot_and_gc() {
         program_id: PROGRAM_ID,
         accounts: accounts::CloseTokenAccountCtx {
             vault: w.vault,
-            cold_owner: w.cold.pubkey(),
+            owner: w.cold.pubkey(),
             token: p.token,
             token_program: TOKEN_PROGRAM_ID,
         }
@@ -832,7 +833,7 @@ fn close_vault_rejected_while_buyback_slot_live() {
         program_id: PROGRAM_ID,
         accounts: accounts::CloseVault {
             vault: w.vault,
-            cold_owner: w.cold.pubkey(),
+            owner: w.cold.pubkey(),
         }
         .to_account_metas(None),
         data: instruction::CloseVault {}.data(),
@@ -861,7 +862,7 @@ fn withdraw_pnft_cold_only_and_within_packet_budget() {
 
     let withdraw_accounts = |payer: Pubkey| accounts::WithdrawPnft {
         vault: w.vault,
-        cold_owner: w.cold.pubkey(),
+        owner: w.cold.pubkey(),
         payer,
         nft_mint: p.mint,
         nft_token: p.token,
@@ -885,7 +886,7 @@ fn withdraw_pnft_cold_only_and_within_packet_budget() {
         accounts: withdraw_accounts(w.hot.pubkey()).to_account_metas(None),
         data: instruction::WithdrawPnft {}.data(),
     };
-    // Impostor in the cold_owner slot. The vault PDA derives from the cold
+    // Impostor in the owner slot. The vault PDA derives from the cold
     // key, so anchor rejects this at the seeds check (before has_one).
     impostor_ix.accounts[1].pubkey = w.hot.pubkey();
     // Production shape: the phone (hot key) pays fees, the card only signs.
@@ -972,7 +973,7 @@ fn withdraw_pnft_without_rule_set_absent_optional_slots() {
         program_id: PROGRAM_ID,
         accounts: accounts::WithdrawPnft {
             vault: w.vault,
-            cold_owner: w.cold.pubkey(),
+            owner: w.cold.pubkey(),
             payer: w.payer.pubkey(),
             nft_mint: p.mint,
             nft_token: p.token,
@@ -1178,7 +1179,7 @@ fn cold_rescue_withdraws_delegated_prize_and_frees_slot() {
         program_id: PROGRAM_ID,
         accounts: accounts::WithdrawPnft {
             vault: w.vault,
-            cold_owner: w.cold.pubkey(),
+            owner: w.cold.pubkey(),
             payer: w.payer.pubkey(),
             nft_mint: p.mint,
             nft_token: p.token,
@@ -1255,13 +1256,13 @@ fn hot_rotation_leaves_onchain_delegate_live() {
     let new_hot = Keypair::new();
     let ix = Instruction {
         program_id: PROGRAM_ID,
-        accounts: accounts::ColdAuthority {
+        accounts: accounts::OwnerAuthority {
             vault: w.vault,
-            cold_owner: w.cold.pubkey(),
+            owner: w.cold.pubkey(),
         }
         .to_account_metas(None),
         data: instruction::UpdateVault {
-            hot_delegate: Some(new_hot.pubkey()),
+            session_key: Some(new_hot.pubkey()),
             per_spin_cap: None,
             daily_cap: None,
         }
@@ -1475,9 +1476,10 @@ fn patch_config(w: &mut World, usdc_mint: Pubkey, paused: bool) {
         gacha_wallet: w.cc_operator.pubkey(),
         gacha_usdc_account: Pubkey::new_unique(),
         fee_usdc_account: Pubkey::new_unique(),
-        fee_bps: 0,
+        min_fee_bps: 0,
+        max_fee_bps: 1_000,
         paused,
-        _reserved: false,
+        _reserved: 0,
         allow_buyback_delegation: true,
         bump,
     };
@@ -1524,7 +1526,7 @@ fn buyback_pnft_ix(
         accounts: accounts::BuybackPnft {
             config: w.config,
             vault: w.vault,
-            hot_delegate: w.hot.pubkey(),
+            session_key: w.hot.pubkey(),
             cc_authority: w.cc_operator.pubkey(),
             destination_owner,
             usdc_mint,

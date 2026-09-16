@@ -21,6 +21,12 @@ pub const SECONDS_PER_DAY: i64 = 86_400;
 /// Hard ceiling on the Tangem fee so a compromised admin key cannot set a
 /// confiscatory fee (10%).
 pub const MAX_FEE_BPS: u16 = 1_000;
+/// Config byte layout (8-byte discriminator included). `min_fee_bps` sits where
+/// the pre-corridor `fee_bps` lived, so a 174-byte legacy image is migrated in
+/// place by `migrate_config`, which appends `max_fee_bps` after `bump`.
+pub const CONFIG_LEGACY_LEN: usize = 174;
+pub const CONFIG_MIN_FEE_OFFSET: usize = 168;
+pub const CONFIG_MAX_FEE_OFFSET: usize = 174;
 /// Metaplex Core — the asset standard most current CC prizes use (older
 /// prizes are Token Metadata pNFTs).
 pub const MPL_CORE_ID: Pubkey =
@@ -60,22 +66,22 @@ pub const AUTH_RULES_ID: Pubkey =
 ///   and `allow_buyback_delegation` should be set false permanently, which
 ///   retires the standing-delegate drain risk entirely.
 ///
-/// The spin path: `open_pack` pays the CC treasury from the vault via an
+/// The spin path: `purchase_pack` pays the CC treasury from the vault via an
 /// inner CPI transfer; the client adds a top-level `<memo>:open` memo
 /// instruction, and CC's webhook credits the spin by matching memo + treasury
 /// transfer (inner instructions included; no gacha-wallet co-signature, no
 /// payer registration needed).
 ///
 /// Trust model (honest worst case):
-/// - `cold_owner` (Tangem card key) is the root authority: rotate the hot
+/// - `owner` (Tangem card key) is the root authority: rotate the hot
 ///   delegate, change caps, withdraw any asset anywhere, close the vault.
-/// - `hot_delegate` (phone key) can:
+/// - `session_key` (phone key) can:
 ///   (a) pay for spins within the per-spin/daily caps, and ONLY to the
 ///       whitelisted treasury accounts fixed in the config. Note what the caps
 ///       do NOT bound: the prize RECIPIENT is `altPlayerAddress`, chosen
 ///       off-chain when the memo is minted, and CC credits whichever memo
 ///       accompanies a treasury transfer regardless of who paid. A compromised
-///       hot key can therefore spend the vault's USDC on spins whose prizes are
+///       session key can therefore spend the vault's USDC on spins whose prizes are
 ///       delivered to ITS OWN wallet, realizing the caps as value, not as
 ///       waste. Size `daily_cap` as a theft budget. The only binding is
 ///       operational: the Tangem backend must mint memos exclusively with
@@ -83,7 +89,7 @@ pub const AUTH_RULES_ID: Pubkey =
 ///       alarm on a memo it did not issue or a prize not delivered to the PDA.
 ///   (b) take a transfer delegate over vault-held prize pNFTs one at a time.
 ///       A transfer delegate can move that pNFT ANYWHERE (the CC ruleset blocks
-///       nothing), so a compromised hot key can drain vault pNFTs one-by-one by
+///       nothing), so a compromised session key can drain vault pNFTs one-by-one by
 ///       cycling approve → transfer → clear. The one-live-delegate slot and the
 ///       `allow_buyback_delegation` kill switch bound the rate of THIS path
 ///       only; `revoke_buyback` and `update_vault` (rotate key) are the
@@ -95,7 +101,7 @@ pub const AUTH_RULES_ID: Pubkey =
 ///   buyback — one that sends the prize to an UNCONSTRAINED `destination_owner`
 ///   of that signer's choosing, for pNFTs and for Core alike. So admin + hot
 ///   together can move ANY prize out of ANY vault, to any address, at any
-///   `price > 0`, with no cold-key tap: `price` has no on-chain floor, the caps
+///   `price > 0`, with no owner-key tap: `price` has no on-chain floor, the caps
 ///   do not apply, and the one-live-delegate slot does not either. In
 ///   particular Core prizes are no longer cold-only — before these
 ///   instructions, `withdraw_core` was their sole exit. Hold the admin key in a
@@ -104,16 +110,16 @@ pub const AUTH_RULES_ID: Pubkey =
 ///   `gacha_usdc_account` or `fee_usdc_account` as break-glass. Incident levers,
 ///   in order of bluntness: repoint `gacha_wallet` (disables both buybacks
 ///   globally and moves the sweep rent away, while spins keep working, since
-///   `open_pack` pins the separate `gacha_usdc_account`); `paused` (stops spins
-///   and buybacks for everyone); per vault, a cold-key `update_vault` hot
+///   `purchase_pack` pins the separate `gacha_usdc_account`); `paused` (stops spins
+///   and buybacks for everyone); per vault, a owner-key `update_vault` hot
 ///   rotation. `allow_buyback_delegation` gates `approve_buyback` ONLY and is
 ///   not a brake on the atomic buybacks.
 ///   The admin key also reaches value on a SECOND, independent path: the same
 ///   one-signature `update_config` rewrites `gacha_usdc_account` and
 ///   `fee_usdc_account`, and those two pins are the only destination checks
-///   `open_pack` performs. One admin write therefore diverts 100% of every
+///   `purchase_pack` performs. One admin write therefore diverts 100% of every
 ///   FUTURE spin payment — principal and fee, every vault, Config being a
-///   singleton — to an attacker-owned USDC account, with no hot key involved:
+///   singleton — to an attacker-owned USDC account, with no session key involved:
 ///   users keep spinning, CC never credits the spins, the money lands
 ///   elsewhere. `MAX_FEE_BPS` bounds the fee rate, not this.
 /// - Collector Crypt: for Core prizes CC holds collection-level
@@ -131,10 +137,11 @@ pub mod tangem_gacha_vault {
         gacha_wallet: Pubkey,
         gacha_usdc_account: Pubkey,
         fee_usdc_account: Pubkey,
-        fee_bps: u16,
+        min_fee_bps: u16,
+        max_fee_bps: u16,
         allow_buyback_delegation: bool,
     ) -> Result<()> {
-        require!(fee_bps <= MAX_FEE_BPS, VaultError::InvalidFeeBps);
+        validate_fee_corridor(min_fee_bps, max_fee_bps)?;
         // `usdc_mint` is written here and NOWHERE else — `update_config` has no
         // parameter for it and the config PDA can neither be closed nor
         // re-initialized, so this choice is permanent for the life of the
@@ -154,9 +161,10 @@ pub mod tangem_gacha_vault {
         config.gacha_wallet = gacha_wallet;
         config.gacha_usdc_account = gacha_usdc_account;
         config.fee_usdc_account = fee_usdc_account;
-        config.fee_bps = fee_bps;
+        config.min_fee_bps = min_fee_bps;
+        config.max_fee_bps = max_fee_bps;
         config.paused = false;
-        config._reserved = false;
+        config._reserved = 0;
         config.allow_buyback_delegation = allow_buyback_delegation;
         config.bump = ctx.bumps.config;
         Ok(())
@@ -170,7 +178,8 @@ pub mod tangem_gacha_vault {
         gacha_wallet: Option<Pubkey>,
         gacha_usdc_account: Option<Pubkey>,
         fee_usdc_account: Option<Pubkey>,
-        fee_bps: Option<u16>,
+        min_fee_bps: Option<u16>,
+        max_fee_bps: Option<u16>,
         paused: Option<bool>,
         allow_buyback_delegation: Option<bool>,
     ) -> Result<()> {
@@ -187,10 +196,13 @@ pub mod tangem_gacha_vault {
         if let Some(v) = fee_usdc_account {
             config.fee_usdc_account = v;
         }
-        if let Some(v) = fee_bps {
-            require!(v <= MAX_FEE_BPS, VaultError::InvalidFeeBps);
-            config.fee_bps = v;
+        if let Some(v) = min_fee_bps {
+            config.min_fee_bps = v;
         }
+        if let Some(v) = max_fee_bps {
+            config.max_fee_bps = v;
+        }
+        validate_fee_corridor(config.min_fee_bps, config.max_fee_bps)?;
         if let Some(v) = paused {
             config.paused = v;
         }
@@ -202,20 +214,89 @@ pub mod tangem_gacha_vault {
             gacha_wallet: config.gacha_wallet,
             gacha_usdc_account: config.gacha_usdc_account,
             fee_usdc_account: config.fee_usdc_account,
-            fee_bps: config.fee_bps,
+            min_fee_bps: config.min_fee_bps,
+            max_fee_bps: config.max_fee_bps,
             paused: config.paused,
             allow_buyback_delegation: config.allow_buyback_delegation,
         });
         Ok(())
     }
 
-    /// Creates the per-user vault. The Tangem card taps ONCE here (cold_owner
-    /// signature); the phone wallet pays rent so the cold-signed message stays
+    /// One-shot layout migration for a Config created before the fee corridor
+    /// existed (174 bytes: `fee_bps` at offset 168, no `max_fee_bps`). Grows
+    /// the account by two bytes and writes `max_fee_bps`; the old `fee_bps`
+    /// byte pair becomes `min_fee_bps` in place. Anchor cannot deserialize the
+    /// legacy image with the new type (too short), so the account is validated
+    /// by hand: PDA seeds (constraint), program ownership, discriminator, and
+    /// the stored admin against the signer. Idempotent — a Config that already
+    /// has the new length is left untouched. Between the program upgrade and
+    /// this call every instruction that reads Config fails with
+    /// AccountDidNotDeserialize (3003), so run it right after deploying.
+    pub fn migrate_config(ctx: Context<MigrateConfig>, max_fee_bps: u16) -> Result<()> {
+        let info = ctx.accounts.config.to_account_info();
+        require_keys_eq!(*info.owner, crate::ID, VaultError::InvalidConfigAccount);
+        let new_len = 8 + Config::INIT_SPACE;
+        {
+            let data = info.try_borrow_data()?;
+            require!(
+                data.len() >= CONFIG_LEGACY_LEN && &data[..8] == Config::DISCRIMINATOR,
+                VaultError::InvalidConfigAccount
+            );
+            let stored_admin = Pubkey::try_from(&data[8..40])
+                .map_err(|_| VaultError::InvalidConfigAccount)?;
+            require_keys_eq!(stored_admin, ctx.accounts.admin.key(), VaultError::Unauthorized);
+            if data.len() >= new_len {
+                return Ok(());
+            }
+        }
+        // Top up rent for the larger account before growing it.
+        let required = Rent::get()?.minimum_balance(new_len);
+        let have = info.lamports();
+        if have < required {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.to_account_info(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.admin.to_account_info(),
+                        to: info.clone(),
+                    },
+                ),
+                required - have,
+            )?;
+        }
+        info.resize(new_len)?;
+        {
+            let mut data = info.try_borrow_mut_data()?;
+            let min_fee_bps = u16::from_le_bytes([
+                data[CONFIG_MIN_FEE_OFFSET],
+                data[CONFIG_MIN_FEE_OFFSET + 1],
+            ]);
+            validate_fee_corridor(min_fee_bps, max_fee_bps)?;
+            data[CONFIG_MAX_FEE_OFFSET..CONFIG_MAX_FEE_OFFSET + 2]
+                .copy_from_slice(&max_fee_bps.to_le_bytes());
+        }
+        let data = info.try_borrow_data()?;
+        let config = Config::try_deserialize(&mut &data[..])?;
+        emit!(ConfigUpdated {
+            admin: config.admin,
+            gacha_wallet: config.gacha_wallet,
+            gacha_usdc_account: config.gacha_usdc_account,
+            fee_usdc_account: config.fee_usdc_account,
+            min_fee_bps: config.min_fee_bps,
+            max_fee_bps: config.max_fee_bps,
+            paused: config.paused,
+            allow_buyback_delegation: config.allow_buyback_delegation,
+        });
+        Ok(())
+    }
+
+    /// Creates the per-user vault. The Tangem card taps ONCE here (owner
+    /// signature); the phone wallet pays rent so the owner-signed message stays
     /// minimal (Tangem cards have a stricter transaction-size budget than
     /// Solana itself).
     pub fn init_vault(
         ctx: Context<InitVault>,
-        hot_delegate: Pubkey,
+        session_key: Pubkey,
         per_spin_cap: u64,
         daily_cap: u64,
     ) -> Result<()> {
@@ -224,8 +305,8 @@ pub mod tangem_gacha_vault {
             VaultError::InvalidCaps
         );
         let vault = &mut ctx.accounts.vault;
-        vault.cold_owner = ctx.accounts.cold_owner.key();
-        vault.hot_delegate = hot_delegate;
+        vault.owner = ctx.accounts.owner.key();
+        vault.session_key = session_key;
         vault.per_spin_cap = per_spin_cap;
         vault.daily_cap = daily_cap;
         vault.spent_today = 0;
@@ -236,25 +317,25 @@ pub mod tangem_gacha_vault {
         vault.bump = ctx.bumps.vault;
         emit!(VaultInitialized {
             vault: vault.key(),
-            cold_owner: vault.cold_owner,
-            hot_delegate,
+            owner: vault.owner,
+            session_key,
         });
         Ok(())
     }
 
-    /// Cold-key-only: rotate the hot delegate and/or adjust caps.
+    /// Owner-only: rotate the session key and/or adjust caps.
     pub fn update_vault(
-        ctx: Context<ColdAuthority>,
-        hot_delegate: Option<Pubkey>,
+        ctx: Context<OwnerAuthority>,
+        session_key: Option<Pubkey>,
         per_spin_cap: Option<u64>,
         daily_cap: Option<u64>,
     ) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
-        if let Some(v) = hot_delegate {
-            vault.hot_delegate = v;
-            emit!(HotDelegateRotated {
+        if let Some(v) = session_key {
+            vault.session_key = v;
+            emit!(SessionKeyRotated {
                 vault: vault.key(),
-                hot_delegate: v
+                session_key: v
             });
         }
         if let Some(v) = per_spin_cap {
@@ -271,14 +352,24 @@ pub mod tangem_gacha_vault {
     }
 
     /// Pay for one gacha spin straight from the vault, signed only by the
-    /// hot key.
+    /// session key.
     ///
     /// Sends `amount` USDC from the vault to the whitelisted Collector Crypt
     /// treasury token account. The `memo` argument must be
     /// `<memo returned by /api/generatePack>` + `":open"` — the API field is
-    /// the bare `<slug>-<uuid>` join key; the BACKEND appends the suffix. A
-    /// Tangem fee of `fee_bps` is charged ON TOP of `amount` into the fee
-    /// treasury, atomically.
+    /// the bare `<slug>-<uuid>` join key; the BACKEND appends the suffix.
+    /// `fee_amount` is the Tangem fee, charged ON TOP of `amount` into the fee
+    /// treasury, atomically. The exact per-machine rate lives on Tangem's
+    /// backend; on-chain the fee must fall inside the admin-set corridor —
+    /// both bounds are inclusive floors,
+    /// `floor(amount * min_fee_bps / 10_000) <= fee_amount <=
+    /// floor(amount * max_fee_bps / 10_000)`, so a backend MUST round down —
+    /// and under the hard `MAX_FEE_BPS` ceiling regardless of config contents.
+    /// Honest scope: only the FLOOR is enforced against the signer. The session
+    /// key is the user's, so a hand-built transaction can pay `min_fee_bps`
+    /// instead of the machine's rate; the ceiling protects the user from the
+    /// backend, the floor protects Tangem from the user, and the backend-chosen
+    /// rate in between is reconciled off-chain via `PackOpened.fee`.
     ///
     /// CLIENT CONTRACT: the transaction MUST carry a TOP-LEVEL spl-memo
     /// instruction with the same string — that memo plus the treasury
@@ -289,7 +380,12 @@ pub mod tangem_gacha_vault {
     /// `memo` arg here is validated and recorded in the PackOpened event for
     /// reconciliation; the program does NOT emit its own memo instruction —
     /// CC's indexer only reads the top-level one.
-    pub fn open_pack(ctx: Context<OpenPack>, amount: u64, memo: String) -> Result<()> {
+    pub fn purchase_pack(
+        ctx: Context<PurchasePack>,
+        amount: u64,
+        fee_amount: u64,
+        memo: String,
+    ) -> Result<()> {
         let config = &ctx.accounts.config;
         require!(!config.paused, VaultError::Paused);
         require!(amount > 0, VaultError::ZeroAmount);
@@ -298,14 +394,15 @@ pub mod tangem_gacha_vault {
             VaultError::InvalidMemo
         );
 
-        let fee = compute_fee(amount, config.fee_bps)?;
+        require_fee_in_corridor(amount, fee_amount, config.min_fee_bps, config.max_fee_bps)?;
+        let fee = fee_amount;
         let total = amount.checked_add(fee).ok_or(VaultError::MathOverflow)?;
         charge_spending(&mut ctx.accounts.vault, total)?;
 
         let vault_key = ctx.accounts.vault.key();
         let seeds: &[&[u8]] = &[
             VAULT_SEED,
-            ctx.accounts.vault.cold_owner.as_ref(),
+            ctx.accounts.vault.owner.as_ref(),
             &[ctx.accounts.vault.bump],
         ];
         let signer_seeds: &[&[&[u8]]] = &[seeds];
@@ -344,7 +441,7 @@ pub mod tangem_gacha_vault {
 
         emit!(PackOpened {
             vault: vault_key,
-            cold_owner: ctx.accounts.vault.cold_owner,
+            owner: ctx.accounts.vault.owner,
             amount,
             fee,
             memo,
@@ -354,20 +451,20 @@ pub mod tangem_gacha_vault {
 
     /// Hot-delegate action: take a Metaplex Token Metadata TRANSFER delegate
     /// (TokenDelegateRole::Transfer, amount = 1) over ONE vault-held prize
-    /// pNFT, so the hot key can countersign Collector Crypt's buyback
+    /// pNFT, so the session key can countersign Collector Crypt's buyback
     /// transaction as the transfer authority (requires CC to build the buyback
-    /// tx with authority = delegate, fee payer = the hot key, and without the
+    /// tx with authority = delegate, fee payer = the session key, and without the
     /// closeAccount instruction; `altRecipient` points the USDC refund at the
     /// vault).
     ///
     /// HONEST TRADE-OFF: a transfer delegate can move the pNFT to ANY address
     /// (the CC ruleset blocks nothing), entirely outside this program. Only
     /// one delegate may be live per vault at a time (`live_buyback_mint`), so
-    /// a compromised hot key drains prizes serially, not in one shot — the
+    /// a compromised session key drains prizes serially, not in one shot — the
     /// slot frees only when the previous NFT provably left or was revoked
     /// (`clear_buyback_slot` / `revoke_buyback`). The admin kill switch is
     /// `allow_buyback_delegation`; the cold-side controls are `revoke_buyback`
-    /// and rotating the hot key.
+    /// and rotating the session key.
     pub fn approve_buyback(ctx: Context<ApproveBuyback>) -> Result<()> {
         require_auth_rules_program(&ctx.accounts.authorization_rules_program)?;
         let config = &ctx.accounts.config;
@@ -388,7 +485,7 @@ pub mod tangem_gacha_vault {
 
         let seeds: &[&[u8]] = &[
             VAULT_SEED,
-            ctx.accounts.vault.cold_owner.as_ref(),
+            ctx.accounts.vault.owner.as_ref(),
             &[ctx.accounts.vault.bump],
         ];
 
@@ -396,14 +493,14 @@ pub mod tangem_gacha_vault {
         // Option args receive `Option<&AccountInfo>` (deref coercion does not
         // reach through `Some(..)`).
         let tmp = ctx.accounts.token_metadata_program.to_account_info();
-        let delegate_info = ctx.accounts.hot_delegate.to_account_info();
+        let delegate_info = ctx.accounts.session_key.to_account_info();
         let metadata_info = ctx.accounts.metadata.to_account_info();
         let edition_info = ctx.accounts.edition.to_account_info();
         let token_record_info = ctx.accounts.token_record.to_account_info();
         let vault_info = ctx.accounts.vault.to_account_info();
         let mint_info = ctx.accounts.nft_mint.to_account_info();
         let token_info = ctx.accounts.nft_token.to_account_info();
-        let payer_info = ctx.accounts.hot_delegate.to_account_info();
+        let payer_info = ctx.accounts.session_key.to_account_info();
         let system_info = ctx.accounts.system_program.to_account_info();
         let sysvar_info = ctx.accounts.sysvar_instructions.to_account_info();
         let token_program_info = ctx.accounts.token_program.to_account_info();
@@ -446,19 +543,19 @@ pub mod tangem_gacha_vault {
     }
 
     /// Revoke the pNFT transfer delegate and free the buyback slot. Callable
-    /// by cold owner or hot delegate.
+    /// by owner or session key.
     pub fn revoke_buyback(ctx: Context<RevokeBuyback>) -> Result<()> {
         require_auth_rules_program(&ctx.accounts.authorization_rules_program)?;
         let authority = ctx.accounts.authority.key();
         require!(
-            authority == ctx.accounts.vault.cold_owner
-                || authority == ctx.accounts.vault.hot_delegate,
+            authority == ctx.accounts.vault.owner
+                || authority == ctx.accounts.vault.session_key,
             VaultError::Unauthorized
         );
 
         let seeds: &[&[u8]] = &[
             VAULT_SEED,
-            ctx.accounts.vault.cold_owner.as_ref(),
+            ctx.accounts.vault.owner.as_ref(),
             &[ctx.accounts.vault.bump],
         ];
 
@@ -518,7 +615,7 @@ pub mod tangem_gacha_vault {
     /// on-chain proof against the EXACT account that was delegated
     /// (`live_buyback_token`): it must be empty or delegate-free. Presenting a
     /// different vault-owned account of the same mint cannot forge completion.
-    /// Callable by cold owner or hot delegate.
+    /// Callable by owner or session key.
     ///
     /// NOT needed after `buyback_pnft`, which frees the slot itself. Calling it
     /// then fails with Anchor `AccountNotInitialized` (3012) on `nft_token` —
@@ -528,7 +625,7 @@ pub mod tangem_gacha_vault {
         let authority = ctx.accounts.authority.key();
         let vault = &ctx.accounts.vault;
         require!(
-            authority == vault.cold_owner || authority == vault.hot_delegate,
+            authority == vault.owner || authority == vault.session_key,
             VaultError::Unauthorized
         );
         let live_token = vault.live_buyback_token.ok_or(VaultError::NoLiveBuyback)?;
@@ -554,7 +651,7 @@ pub mod tangem_gacha_vault {
     /// and receives the NFT in the same instruction — the vault PDA signs the
     /// Token Metadata TransferV1 as the OWNER, so no standing delegate is
     /// involved. Two signatures: the CC operator wallet fixed in the config
-    /// (pays the refund, the fees and the rent) and the hot key (user consent
+    /// (pays the refund, the fees and the rent) and the session key (user consent
     /// to the offered price). The NFT lands at `destination_owner` — CC's free
     /// per-transaction choice, since their prizes live across rotating prize
     /// wallets rather than on the operator wallet. The emptied prize ATA is
@@ -571,7 +668,7 @@ pub mod tangem_gacha_vault {
     /// - Prepend `AssociatedTokenAccount::CreateIdempotent(vault_usdc)` (payer
     ///   = `cc_authority`). `buyback_pnft` PINS the vault's canonical USDC ATA
     ///   but does NOT create it, so against a vault that never held USDC — or
-    ///   whose ATA the cold owner closed at offboarding — `buyback_pnft` itself
+    ///   whose ATA the owner closed at offboarding — `buyback_pnft` itself
     ///   aborts with `AccountNotInitialized` (3012).
     /// - Set a compute-unit limit of ~400k: the TransferV1 creates the
     ///   destination ATA + TokenRecord and evaluates the rule set, which does
@@ -581,7 +678,7 @@ pub mod tangem_gacha_vault {
     ///   bounds `price` beyond `> 0`), and refuse any transaction carrying an
     ///   instruction of this program other than the single buyback it is
     ///   showing. Consent is instruction-scoped, not transaction-scoped, and a
-    ///   bundled `open_pack` would be signed by the very same hot key.
+    ///   bundled `purchase_pack` would be signed by the very same session key.
     ///
     /// SCOPE, HONESTLY: `nft_mint` carries no collection or creator pin — this
     /// moves ANY vault-held NFT, not only CC-issued prizes. The client is what
@@ -618,7 +715,7 @@ pub mod tangem_gacha_vault {
 
         let seeds: &[&[u8]] = &[
             VAULT_SEED,
-            ctx.accounts.vault.cold_owner.as_ref(),
+            ctx.accounts.vault.owner.as_ref(),
             &[ctx.accounts.vault.bump],
         ];
 
@@ -709,7 +806,7 @@ pub mod tangem_gacha_vault {
     }
 
     /// Atomic buyback of a Metaplex CORE prize — same contract as
-    /// `buyback_pnft` (CC operator wallet + hot key sign; USDC refund into
+    /// `buyback_pnft` (CC operator wallet + session key sign; USDC refund into
     /// the vault, then the asset moves), but a single light mpl-core transfer:
     /// the vault PDA signs as the asset owner, Core assets ship unfrozen, and
     /// there are no token accounts to garbage-collect. The asset lands at
@@ -749,7 +846,7 @@ pub mod tangem_gacha_vault {
 
         let seeds: &[&[u8]] = &[
             VAULT_SEED,
-            ctx.accounts.vault.cold_owner.as_ref(),
+            ctx.accounts.vault.owner.as_ref(),
             &[ctx.accounts.vault.bump],
         ];
         // mpl-core TransferV1, same wire format as withdraw_core. The new
@@ -791,7 +888,7 @@ pub mod tangem_gacha_vault {
         Ok(())
     }
 
-    /// Cold-key-only: withdraw a fungible SPL asset (USDC) from the vault to
+    /// Owner-only: withdraw a fungible SPL asset (USDC) from the vault to
     /// any destination token account (other than the source itself).
     pub fn withdraw_token(ctx: Context<WithdrawToken>, amount: u64) -> Result<()> {
         require!(amount > 0, VaultError::ZeroAmount);
@@ -805,7 +902,7 @@ pub mod tangem_gacha_vault {
             VaultError::Unauthorized
         );
         let vault = &ctx.accounts.vault;
-        let seeds: &[&[u8]] = &[VAULT_SEED, vault.cold_owner.as_ref(), &[vault.bump]];
+        let seeds: &[&[u8]] = &[VAULT_SEED, vault.owner.as_ref(), &[vault.bump]];
         token_interface::transfer_checked(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -828,7 +925,7 @@ pub mod tangem_gacha_vault {
         Ok(())
     }
 
-    /// Cold-key-only: withdraw a prize pNFT from the vault to any wallet
+    /// Owner-only: withdraw a prize pNFT from the vault to any wallet
     /// (typically the user's cold address for long-term storage). Goes through
     /// Token Metadata TransferV1 because pNFT token accounts are frozen.
     ///
@@ -837,7 +934,7 @@ pub mod tangem_gacha_vault {
     /// means an absent one is passed as THIS PROGRAM's id, not omitted — the
     /// slots are not last, so dropping them shifts the five accounts after them
     /// and fails. CC cards carry the Metaplex Foundation Rule Set, so in
-    /// practice both hold real accounts. The cold key only signs; the phone
+    /// practice both hold real accounts. The owner key only signs; the phone
     /// should be the fee payer. Validate the total message size against the
     /// Tangem card signing budget.
     ///
@@ -846,12 +943,12 @@ pub mod tangem_gacha_vault {
     /// MUST prepend a `ComputeBudgetInstruction::set_compute_unit_limit(300_000)`
     /// or the transaction fails on-chain with "exceeded CUs meter" (negative
     /// control: tests/pnft.rs `withdraw_pnft_cold_only_and_within_packet_budget`).
-    /// Measured cold-signed message 682 B / serialized tx 811 B incl. that ix.
+    /// Measured owner-signed message 682 B / serialized tx 811 B incl. that ix.
     pub fn withdraw_pnft(ctx: Context<WithdrawPnft>) -> Result<()> {
         require_auth_rules_program(&ctx.accounts.authorization_rules_program)?;
         let seeds: &[&[u8]] = &[
             VAULT_SEED,
-            ctx.accounts.vault.cold_owner.as_ref(),
+            ctx.accounts.vault.owner.as_ref(),
             &[ctx.accounts.vault.bump],
         ];
 
@@ -910,7 +1007,7 @@ pub mod tangem_gacha_vault {
         Ok(())
     }
 
-    /// Cold-key-only: withdraw a Metaplex CORE prize (AssetV1 — the standard
+    /// Owner-only: withdraw a Metaplex CORE prize (AssetV1 — the standard
     /// most current CC prizes use; no token accounts, the owner lives inside
     /// the asset) from the vault to any wallet.
     ///
@@ -921,11 +1018,11 @@ pub mod tangem_gacha_vault {
     /// CC can move or burn any Core prize regardless of custody — for Core
     /// prizes the vault protects against key theft, not against CC. This is no
     /// longer the ONLY exit for a Core asset either: `buyback_core` moves one
-    /// on `cc_authority` + `hot_delegate` signatures, without the cold key.
+    /// on `cc_authority` + `session_key` signatures, without the owner key.
     pub fn withdraw_core(ctx: Context<WithdrawCore>) -> Result<()> {
         let seeds: &[&[u8]] = &[
             VAULT_SEED,
-            ctx.accounts.vault.cold_owner.as_ref(),
+            ctx.accounts.vault.owner.as_ref(),
             &[ctx.accounts.vault.bump],
         ];
         // mpl-core TransferV1: 1-byte discriminator 14 + Option<CompressionProof>
@@ -966,8 +1063,8 @@ pub mod tangem_gacha_vault {
         Ok(())
     }
 
-    /// Cold-key-only: close an EMPTY vault-owned token account and return its
-    /// rent to the cold owner. This is the GC path for NFT ATAs left behind by
+    /// Owner-only: close an EMPTY vault-owned token account and return its
+    /// rent to the owner. This is the GC path for NFT ATAs left behind by
     /// completed buybacks (CC's template normally closes them, but the
     /// delegate-authority variant cannot) and for the USDC ATA at offboarding.
     /// The TokenRecord needs no GC: Token Metadata TransferV1 closes the
@@ -990,12 +1087,12 @@ pub mod tangem_gacha_vault {
             VaultError::BuybackStillActive
         );
         let vault = &ctx.accounts.vault;
-        let seeds: &[&[u8]] = &[VAULT_SEED, vault.cold_owner.as_ref(), &[vault.bump]];
+        let seeds: &[&[u8]] = &[VAULT_SEED, vault.owner.as_ref(), &[vault.bump]];
         token_interface::close_account(CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             CloseAccount {
                 account: ctx.accounts.token.to_account_info(),
-                destination: ctx.accounts.cold_owner.to_account_info(),
+                destination: ctx.accounts.owner.to_account_info(),
                 authority: ctx.accounts.vault.to_account_info(),
             },
             &[seeds],
@@ -1021,7 +1118,7 @@ pub mod tangem_gacha_vault {
     /// vault-owned token account that the live buyback slot does not point at,
     /// and it forwards EXACTLY the rent-exempt minimum to the config-pinned CC
     /// wallet — an arbitrary caller gains nothing and can move nothing but that
-    /// rent. (The cold owner's `close_token_account`, which routes everything to
+    /// rent. (The owner's `close_token_account`, which routes everything to
     /// the user, remains for self-GC.)
     ///
     /// The close lands in the VAULT first and only the rent is forwarded, so
@@ -1059,7 +1156,7 @@ pub mod tangem_gacha_vault {
             .min(token_info.lamports());
 
         let vault = &ctx.accounts.vault;
-        let seeds: &[&[u8]] = &[VAULT_SEED, vault.cold_owner.as_ref(), &[vault.bump]];
+        let seeds: &[&[u8]] = &[VAULT_SEED, vault.owner.as_ref(), &[vault.bump]];
         token_interface::close_account(CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             CloseAccount {
@@ -1084,7 +1181,7 @@ pub mod tangem_gacha_vault {
         Ok(())
     }
 
-    /// Cold-key-only: withdraw excess SOL from the vault PDA. Keeps the vault
+    /// Owner-only: withdraw excess SOL from the vault PDA. Keeps the vault
     /// rent-exempt.
     pub fn withdraw_sol(ctx: Context<WithdrawSol>, lamports: u64) -> Result<()> {
         require!(lamports > 0, VaultError::ZeroAmount);
@@ -1113,16 +1210,16 @@ pub mod tangem_gacha_vault {
         Ok(())
     }
 
-    /// Cold-key-only: close the vault state account, returning rent to the
-    /// cold owner. Withdraw assets and close token accounts (via
+    /// Owner-only: close the vault state account, returning rent to the
+    /// owner. Withdraw assets and close token accounts (via
     /// `close_token_account`) FIRST. Safety net: the PDA derives solely from
-    /// the cold key, so re-running `init_vault` with the same cold owner
+    /// the owner key, so re-running `init_vault` with the same owner
     /// recreates the same address and restores access to anything left behind
     /// (e.g. a prize delivered after closing).
     ///
     /// Gated on a clean delegate state: a live buyback delegate must be
     /// revoked first (via `revoke_buyback` / `clear_buyback_slot`). Otherwise
-    /// a close + re-init would reset the slot while the old hot key's
+    /// a close + re-init would reset the slot while the old session key's
     /// Metaplex delegate stayed live on-chain.
     pub fn close_vault(ctx: Context<CloseVault>) -> Result<()> {
         require!(
@@ -1131,7 +1228,7 @@ pub mod tangem_gacha_vault {
         );
         emit!(VaultClosed {
             vault: ctx.accounts.vault.key(),
-            cold_owner: ctx.accounts.cold_owner.key(),
+            owner: ctx.accounts.owner.key(),
         });
         Ok(())
     }
@@ -1159,6 +1256,37 @@ fn compute_fee(amount: u64, fee_bps: u16) -> Result<u64> {
         .and_then(|v| v.checked_div(10_000))
         .and_then(|v| u64::try_from(v).ok())
         .ok_or_else(|| VaultError::MathOverflow.into())
+}
+
+/// Corridor sanity, enforced wherever the pair is written (initialize_config,
+/// update_config, migrate_config): `min <= max <= MAX_FEE_BPS`, so no config
+/// state can ever authorize a fee above the hard ceiling.
+fn validate_fee_corridor(min_bps: u16, max_bps: u16) -> Result<()> {
+    require!(
+        min_bps <= max_bps && max_bps <= MAX_FEE_BPS,
+        VaultError::InvalidFeeBps
+    );
+    Ok(())
+}
+
+/// The fee a spin may carry. Three bounds, all cross-multiplied in u128 with no
+/// division by `amount`: (1) never above `MAX_FEE_BPS` of `amount` — a hard,
+/// config-independent backstop; (2) never above the admin corridor ceiling;
+/// (3) never below the corridor floor. `f * 10_000 <= a * bps` is exactly
+/// `f <= floor(a * bps / 10_000)`, so BOTH bounds are inclusive floors and a
+/// backend that computes `floor(amount * rate_bps / 10_000)` for any rate
+/// inside the corridor always passes (with min == max exactly one value is
+/// accepted — a backend that rounds up fails with FeeAboveMaximum).
+fn require_fee_in_corridor(amount: u64, fee: u64, min_bps: u16, max_bps: u16) -> Result<()> {
+    let a = amount as u128;
+    let f = fee as u128;
+    require!(
+        f * 10_000 <= a * (MAX_FEE_BPS as u128),
+        VaultError::FeeAboveMaximum
+    );
+    require!(f * 10_000 <= a * (max_bps as u128), VaultError::FeeAboveMaximum);
+    require!(fee >= compute_fee(amount, min_bps)?, VaultError::FeeBelowMinimum);
+    Ok(())
 }
 
 /// Rolls the UTC-day window: a new day starts with a fresh `daily_cap`
@@ -1201,47 +1329,56 @@ pub struct Config {
     /// on `cc_authority`, i.e. the only key that may execute a buyback — one
     /// that sends the prize to an unconstrained `destination_owner` of the
     /// signer's choosing. Admin-writable in one step, so admin +
-    /// a vault's hot key can move that vault's prizes out at any price > 0.
+    /// a vault's session key can move that vault's prizes out at any price > 0.
     /// Repointing it is also the surgical way to disable both buybacks
     /// globally without stopping spins.
     pub gacha_wallet: Pubkey,
     /// Exact USDC token account that receives spin payments. Admin-writable in
-    /// one step, and it is the ONLY destination check `open_pack` performs —
+    /// one step, and it is the ONLY destination check `purchase_pack` performs —
     /// repointing it silently diverts every future spin payment, from every
-    /// vault, with no hot key involved. Value-bearing, not bookkeeping.
+    /// vault, with no session key involved. Value-bearing, not bookkeeping.
     pub gacha_usdc_account: Pubkey,
     /// Tangem fee treasury USDC token account. Admin-writable in one step; same
     /// diversion property as `gacha_usdc_account`, for the fee leg.
     pub fee_usdc_account: Pubkey,
-    /// Tangem fee charged on top of the spin price, in basis points
-    /// (hard-capped at MAX_FEE_BPS).
-    pub fee_bps: u16,
+    /// Floor of the Tangem fee corridor, in basis points of the spin price.
+    /// The exact per-machine rate is chosen by Tangem's backend and passed to
+    /// `purchase_pack` as `fee_amount`; on-chain it must satisfy
+    /// `min_fee_bps <= fee_amount / amount <= max_fee_bps` (see
+    /// `require_fee_in_corridor`). Occupies the byte pair of the pre-corridor
+    /// `fee_bps` (offset 168), so legacy configs keep their old rate as the new
+    /// floor after `migrate_config`.
+    pub min_fee_bps: u16,
     pub paused: bool,
     /// Layout padding left by the removed `allow_usdc_delegation` flag; kept so
     /// already-deployed configs stay layout-compatible. Nothing reads it, and
-    /// `initialize_config` writes false — but the LIVE devnet config still
-    /// carries 1 from the Plan-B era, so any future repurposing must treat 1,
-    /// not 0, as the pre-existing value. (A `bool` also rejects any byte other
-    /// than 0/1 on deserialize; prefer `u8` when the mainnet layout is cut.)
-    pub _reserved: bool,
-    /// Enables `approve_buyback` (pNFT transfer delegation to the hot key) and
+    /// `initialize_config` writes 0 — but the LIVE devnet config still carries
+    /// 1 from the Plan-B era, so any future repurposing must treat 1, not 0,
+    /// as the pre-existing value. Typed `u8` so no byte value can ever make
+    /// the account undeserializable.
+    pub _reserved: u8,
+    /// Enables `approve_buyback` (pNFT transfer delegation to the session key) and
     /// NOTHING else — in particular it does not gate `buyback_pnft` /
     /// `buyback_core`, which need no delegate. Set it false once CC's backend
     /// has migrated to those, which retires the standing-delegate drain risk.
     pub allow_buyback_delegation: bool,
     pub bump: u8,
+    /// Ceiling of the Tangem fee corridor, in basis points of the spin price;
+    /// itself capped by `MAX_FEE_BPS`. Appended after `bump` (offset 174) so
+    /// every earlier field keeps its offset for raw readers.
+    pub max_fee_bps: u16,
 }
 
 #[account]
 #[derive(InitSpace)]
 pub struct Vault {
-    pub cold_owner: Pubkey,
-    pub hot_delegate: Pubkey,
+    pub owner: Pubkey,
+    pub session_key: Pubkey,
     /// Max USDC (incl. fee) a single spin may spend.
     pub per_spin_cap: u64,
     /// Max USDC (incl. fees) spendable per UTC day.
     pub daily_cap: u64,
-    /// Rolled LAZILY — only `open_pack` calls `roll_day`. Meaningful just while
+    /// Rolled LAZILY — only `purchase_pack` calls `roll_day`. Meaningful just while
     /// `day_index == unix_timestamp.div_euclid(86_400)`; against a stale bucket
     /// the real remaining allowance is the full `daily_cap`, so a client
     /// reading this field raw can under-report it by up to one cap.
@@ -1304,18 +1441,32 @@ pub struct UpdateConfig<'info> {
 }
 
 #[derive(Accounts)]
+pub struct MigrateConfig<'info> {
+    /// CHECK: legacy 174-byte Config image, validated by hand in the handler.
+    /// The Config PDA. It is too short to deserialize as the new type, so
+    /// beyond the PDA seeds the handler checks program ownership, the
+    /// discriminator and that the stored admin equals the signer.
+    #[account(mut, seeds = [CONFIG_SEED], bump)]
+    pub config: UncheckedAccount<'info>,
+    /// Pays the rent top-up for the two extra bytes.
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct InitVault<'info> {
     #[account(
         init,
         payer = payer,
         space = 8 + Vault::INIT_SPACE,
-        seeds = [VAULT_SEED, cold_owner.key().as_ref()],
+        seeds = [VAULT_SEED, owner.key().as_ref()],
         bump
     )]
     pub vault: Account<'info, Vault>,
     /// The Tangem card key — must sign vault creation.
-    pub cold_owner: Signer<'info>,
-    /// Rent payer (typically the phone's hot wallet) so the cold-signed
+    pub owner: Signer<'info>,
+    /// Rent payer (typically the phone's hot wallet) so the owner-signed
     /// transaction stays small.
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -1323,29 +1474,29 @@ pub struct InitVault<'info> {
 }
 
 #[derive(Accounts)]
-pub struct ColdAuthority<'info> {
+pub struct OwnerAuthority<'info> {
     #[account(
         mut,
-        seeds = [VAULT_SEED, cold_owner.key().as_ref()],
+        seeds = [VAULT_SEED, owner.key().as_ref()],
         bump = vault.bump,
-        has_one = cold_owner
+        has_one = owner
     )]
     pub vault: Account<'info, Vault>,
-    pub cold_owner: Signer<'info>,
+    pub owner: Signer<'info>,
 }
 
 #[derive(Accounts)]
-pub struct OpenPack<'info> {
+pub struct PurchasePack<'info> {
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
     #[account(
         mut,
-        seeds = [VAULT_SEED, vault.cold_owner.as_ref()],
+        seeds = [VAULT_SEED, vault.owner.as_ref()],
         bump = vault.bump,
-        has_one = hot_delegate
+        has_one = session_key
     )]
     pub vault: Account<'info, Vault>,
-    pub hot_delegate: Signer<'info>,
+    pub session_key: Signer<'info>,
     #[account(address = config.usdc_mint)]
     pub usdc_mint: InterfaceAccount<'info, Mint>,
     /// Pinned to the vault's CANONICAL ATA (not just any vault-owned USDC
@@ -1358,12 +1509,12 @@ pub struct OpenPack<'info> {
     )]
     pub vault_usdc: InterfaceAccount<'info, TokenAccount>,
     /// Whitelisted Collector Crypt treasury account — the ONLY spin
-    /// destination the hot delegate can pay. The mint pin turns a wrong-mint
+    /// destination the session key can pay. The mint pin turns a wrong-mint
     /// address in the config into a loud first-spin failure
     /// (ConstraintTokenMint, 2014) instead of a token-program error mid-CPI.
     #[account(mut, address = config.gacha_usdc_account, token::mint = usdc_mint)]
     pub gacha_usdc: InterfaceAccount<'info, TokenAccount>,
-    /// The mint pin matters MOST here: while `fee_bps = 0` the fee transfer is
+    /// The mint pin matters MOST here: while `fee_amount == 0` the fee transfer is
     /// skipped, so without it a wrong-mint `fee_usdc_account` in the config
     /// would pass silently for as long as the fee stays zero — and then break
     /// every spin of every vault the moment the fee is raised. Failing the
@@ -1380,14 +1531,14 @@ pub struct ApproveBuyback<'info> {
     pub config: Account<'info, Config>,
     #[account(
         mut,
-        seeds = [VAULT_SEED, vault.cold_owner.as_ref()],
+        seeds = [VAULT_SEED, vault.owner.as_ref()],
         bump = vault.bump,
-        has_one = hot_delegate
+        has_one = session_key
     )]
     pub vault: Account<'info, Vault>,
     /// Also pays for the token-record write.
     #[account(mut)]
-    pub hot_delegate: Signer<'info>,
+    pub session_key: Signer<'info>,
     pub nft_mint: InterfaceAccount<'info, Mint>,
     #[account(mut, token::authority = vault, token::mint = nft_mint)]
     pub nft_token: InterfaceAccount<'info, TokenAccount>,
@@ -1422,14 +1573,14 @@ pub struct ApproveBuyback<'info> {
 pub struct RevokeBuyback<'info> {
     #[account(
         mut,
-        seeds = [VAULT_SEED, vault.cold_owner.as_ref()],
+        seeds = [VAULT_SEED, vault.owner.as_ref()],
         bump = vault.bump
     )]
     pub vault: Account<'info, Vault>,
-    /// Cold owner OR hot delegate (checked in the handler); pays fees.
+    /// Owner OR session key (checked in the handler); pays fees.
     #[account(mut)]
     pub authority: Signer<'info>,
-    /// CHECK: the delegate currently written in the token record (the hot key
+    /// CHECK: the delegate currently written in the token record (the session key
     /// that was approved) — validated by the Token Metadata CPI.
     pub delegate: UncheckedAccount<'info>,
     pub nft_mint: InterfaceAccount<'info, Mint>,
@@ -1465,11 +1616,11 @@ pub struct RevokeBuyback<'info> {
 pub struct ClearBuybackSlot<'info> {
     #[account(
         mut,
-        seeds = [VAULT_SEED, vault.cold_owner.as_ref()],
+        seeds = [VAULT_SEED, vault.owner.as_ref()],
         bump = vault.bump
     )]
     pub vault: Account<'info, Vault>,
-    /// Cold owner OR hot delegate (checked in the handler).
+    /// Owner OR session key (checked in the handler).
     pub authority: Signer<'info>,
     /// The exact token account recorded in `live_buyback_token`; the handler
     /// checks token-account identity (`nft_token.key() == live_buyback_token`),
@@ -1487,13 +1638,13 @@ pub struct BuybackPnft<'info> {
     pub config: Box<Account<'info, Config>>,
     #[account(
         mut,
-        seeds = [VAULT_SEED, vault.cold_owner.as_ref()],
+        seeds = [VAULT_SEED, vault.owner.as_ref()],
         bump = vault.bump,
-        has_one = hot_delegate
+        has_one = session_key
     )]
     pub vault: Box<Account<'info, Vault>>,
     /// User consent to the offered price.
-    pub hot_delegate: Signer<'info>,
+    pub session_key: Signer<'info>,
     /// The CC operator wallet fixed in the config: pays the refund, the fees
     /// and the rent; receives the closed ATA's whole lamport balance. The NFT
     /// itself goes to `destination_owner`.
@@ -1503,7 +1654,7 @@ pub struct BuybackPnft<'info> {
     /// choice (prizes return to rotating prize wallets, not to the operator
     /// wallet). Deliberately unconstrained: `cc_authority` signs and pays, so
     /// where CC sends the prize it just bought is CC's own business; the
-    /// user's protection is the price, which the hot key co-signs.
+    /// user's protection is the price, which the session key co-signs.
     pub destination_owner: UncheckedAccount<'info>,
     #[account(address = config.usdc_mint)]
     pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
@@ -1568,13 +1719,13 @@ pub struct BuybackCore<'info> {
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
     #[account(
-        seeds = [VAULT_SEED, vault.cold_owner.as_ref()],
+        seeds = [VAULT_SEED, vault.owner.as_ref()],
         bump = vault.bump,
-        has_one = hot_delegate
+        has_one = session_key
     )]
     pub vault: Account<'info, Vault>,
     /// User consent to the offered price.
-    pub hot_delegate: Signer<'info>,
+    pub session_key: Signer<'info>,
     /// The CC operator wallet fixed in the config: pays the refund and the
     /// fees. The asset itself goes to `destination_owner`.
     #[account(mut, address = config.gacha_wallet)]
@@ -1583,7 +1734,7 @@ pub struct BuybackCore<'info> {
     /// choice (prizes return to rotating prize wallets, not to the operator
     /// wallet). Deliberately unconstrained: `cc_authority` signs and pays, so
     /// where CC sends the prize it just bought is CC's own business; the
-    /// user's protection is the price, which the hot key co-signs.
+    /// user's protection is the price, which the session key co-signs.
     pub destination_owner: UncheckedAccount<'info>,
     #[account(address = config.usdc_mint)]
     pub usdc_mint: InterfaceAccount<'info, Mint>,
@@ -1619,16 +1770,16 @@ pub struct BuybackCore<'info> {
 #[derive(Accounts)]
 pub struct WithdrawToken<'info> {
     #[account(
-        seeds = [VAULT_SEED, cold_owner.key().as_ref()],
+        seeds = [VAULT_SEED, owner.key().as_ref()],
         bump = vault.bump,
-        has_one = cold_owner
+        has_one = owner
     )]
     pub vault: Account<'info, Vault>,
-    pub cold_owner: Signer<'info>,
+    pub owner: Signer<'info>,
     #[account(mut, token::authority = vault, token::mint = mint)]
     pub source: InterfaceAccount<'info, TokenAccount>,
     pub mint: InterfaceAccount<'info, Mint>,
-    /// Any token account of the same mint — destination is the cold owner's
+    /// Any token account of the same mint — destination is the owner's
     /// free choice, except the source itself (rejected in the handler).
     #[account(mut, token::mint = mint)]
     pub destination: InterfaceAccount<'info, TokenAccount>,
@@ -1638,20 +1789,20 @@ pub struct WithdrawToken<'info> {
 #[derive(Accounts)]
 pub struct WithdrawPnft<'info> {
     #[account(
-        seeds = [VAULT_SEED, cold_owner.key().as_ref()],
+        seeds = [VAULT_SEED, owner.key().as_ref()],
         bump = vault.bump,
-        has_one = cold_owner
+        has_one = owner
     )]
     pub vault: Account<'info, Vault>,
-    pub cold_owner: Signer<'info>,
-    /// Fee/rent payer (typically the phone) so the cold-signed message stays
+    pub owner: Signer<'info>,
+    /// Fee/rent payer (typically the phone) so the owner-signed message stays
     /// as small as possible.
     #[account(mut)]
     pub payer: Signer<'info>,
     pub nft_mint: InterfaceAccount<'info, Mint>,
     #[account(mut, token::authority = vault, token::mint = nft_mint)]
     pub nft_token: InterfaceAccount<'info, TokenAccount>,
-    /// CHECK: destination wallet — the cold owner's free choice.
+    /// CHECK: destination wallet — the owner's free choice.
     pub destination_owner: UncheckedAccount<'info>,
     /// CHECK: destination token account (ATA of destination_owner) — created
     /// by the Token Metadata CPI when missing, validated there.
@@ -1692,13 +1843,13 @@ pub struct WithdrawPnft<'info> {
 #[derive(Accounts)]
 pub struct WithdrawCore<'info> {
     #[account(
-        seeds = [VAULT_SEED, cold_owner.key().as_ref()],
+        seeds = [VAULT_SEED, owner.key().as_ref()],
         bump = vault.bump,
-        has_one = cold_owner
+        has_one = owner
     )]
     pub vault: Account<'info, Vault>,
-    pub cold_owner: Signer<'info>,
-    /// Fee payer (typically the phone) so the cold-signed message stays small.
+    pub owner: Signer<'info>,
+    /// Fee payer (typically the phone) so the owner-signed message stays small.
     #[account(mut)]
     pub payer: Signer<'info>,
     /// CHECK: Core AssetV1 account — owner pinned here, contents and ownership
@@ -1709,7 +1860,7 @@ pub struct WithdrawCore<'info> {
     /// CHECK: the asset's Core collection (CC assets carry a Collection update
     /// authority) — mpl-core binds it to the asset itself; see BuybackCore.
     pub collection: UncheckedAccount<'info>,
-    /// CHECK: destination wallet — the cold owner's free choice.
+    /// CHECK: destination wallet — the owner's free choice.
     pub destination_owner: UncheckedAccount<'info>,
     /// CHECK: pinned to the mpl-core program id.
     #[account(address = MPL_CORE_ID)]
@@ -1719,14 +1870,14 @@ pub struct WithdrawCore<'info> {
 #[derive(Accounts)]
 pub struct CloseTokenAccountCtx<'info> {
     #[account(
-        seeds = [VAULT_SEED, cold_owner.key().as_ref()],
+        seeds = [VAULT_SEED, owner.key().as_ref()],
         bump = vault.bump,
-        has_one = cold_owner
+        has_one = owner
     )]
     pub vault: Account<'info, Vault>,
     /// Receives the reclaimed rent.
     #[account(mut)]
-    pub cold_owner: Signer<'info>,
+    pub owner: Signer<'info>,
     #[account(mut, token::authority = vault)]
     pub token: InterfaceAccount<'info, TokenAccount>,
     pub token_program: Interface<'info, TokenInterface>,
@@ -1738,7 +1889,7 @@ pub struct SweepPrizeAta<'info> {
     pub config: Account<'info, Config>,
     /// Writable: the closed account's lamports land here first, and only the
     /// rent-exempt minimum is forwarded on to `rent_destination`.
-    #[account(mut, seeds = [VAULT_SEED, vault.cold_owner.as_ref()], bump = vault.bump)]
+    #[account(mut, seeds = [VAULT_SEED, vault.owner.as_ref()], bump = vault.bump)]
     pub vault: Account<'info, Vault>,
     #[account(mut, token::authority = vault)]
     pub token: InterfaceAccount<'info, TokenAccount>,
@@ -1752,13 +1903,13 @@ pub struct SweepPrizeAta<'info> {
 pub struct WithdrawSol<'info> {
     #[account(
         mut,
-        seeds = [VAULT_SEED, cold_owner.key().as_ref()],
+        seeds = [VAULT_SEED, owner.key().as_ref()],
         bump = vault.bump,
-        has_one = cold_owner
+        has_one = owner
     )]
     pub vault: Account<'info, Vault>,
-    pub cold_owner: Signer<'info>,
-    /// CHECK: recipient is the cold owner's free choice; only receives lamports.
+    pub owner: Signer<'info>,
+    /// CHECK: recipient is the owner's free choice; only receives lamports.
     #[account(mut)]
     pub recipient: UncheckedAccount<'info>,
 }
@@ -1767,14 +1918,14 @@ pub struct WithdrawSol<'info> {
 pub struct CloseVault<'info> {
     #[account(
         mut,
-        close = cold_owner,
-        seeds = [VAULT_SEED, cold_owner.key().as_ref()],
+        close = owner,
+        seeds = [VAULT_SEED, owner.key().as_ref()],
         bump = vault.bump,
-        has_one = cold_owner
+        has_one = owner
     )]
     pub vault: Account<'info, Vault>,
     #[account(mut)]
-    pub cold_owner: Signer<'info>,
+    pub owner: Signer<'info>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1784,14 +1935,14 @@ pub struct CloseVault<'info> {
 #[event]
 pub struct VaultInitialized {
     pub vault: Pubkey,
-    pub cold_owner: Pubkey,
-    pub hot_delegate: Pubkey,
+    pub owner: Pubkey,
+    pub session_key: Pubkey,
 }
 
 #[event]
-pub struct HotDelegateRotated {
+pub struct SessionKeyRotated {
     pub vault: Pubkey,
-    pub hot_delegate: Pubkey,
+    pub session_key: Pubkey,
 }
 
 #[event]
@@ -1800,15 +1951,19 @@ pub struct ConfigUpdated {
     pub gacha_wallet: Pubkey,
     pub gacha_usdc_account: Pubkey,
     pub fee_usdc_account: Pubkey,
-    pub fee_bps: u16,
+    pub min_fee_bps: u16,
+    pub max_fee_bps: u16,
     pub paused: bool,
     pub allow_buyback_delegation: bool,
 }
 
+/// Emitted by `purchase_pack`. The name predates the open_pack → purchase_pack
+/// rename and is kept ON PURPOSE: indexers key on the event discriminator,
+/// which is derived from this name.
 #[event]
 pub struct PackOpened {
     pub vault: Pubkey,
-    pub cold_owner: Pubkey,
+    pub owner: Pubkey,
     pub amount: u64,
     pub fee: u64,
     pub memo: String,
@@ -1867,7 +2022,7 @@ pub struct SolWithdrawn {
 #[event]
 pub struct VaultClosed {
     pub vault: Pubkey,
-    pub cold_owner: Pubkey,
+    pub owner: Pubkey,
 }
 
 #[event]
@@ -1914,12 +2069,13 @@ pub enum VaultError {
     DelegateStillSet,
     #[msg("Insufficient SOL above rent-exempt minimum")]
     InsufficientSol,
-    /// Raised at five distinct sites: a signer that is neither cold owner nor
-    /// hot delegate (revoke_buyback, clear_buyback_slot), a withdraw_sol
+    /// Raised at six distinct sites: a signer that is neither owner nor
+    /// session key (revoke_buyback, clear_buyback_slot), a withdraw_sol
     /// recipient aliasing the vault itself, a withdraw_token destination
     /// aliasing the source, an authorization_rules_program that is not the
-    /// pinned mpl-token-auth-rules id, and an initialize_config admin that is
-    /// not the program's upgrade authority. Kept as one variant so error code
+    /// pinned mpl-token-auth-rules id, a migrate_config signer that is not the
+    /// stored admin, and an initialize_config admin that is not the program's
+    /// upgrade authority. Kept as one variant so error code
     /// 6018 stays stable for deployed clients; the message is deliberately
     /// role-neutral.
     #[msg("Account is not authorized for this operation")]
@@ -1935,4 +2091,10 @@ pub enum VaultError {
     ExcessLamports,
     #[msg("USDC mint must be a legacy SPL Token mint")]
     UnsupportedMint,
+    #[msg("Fee is below the configured minimum")]
+    FeeBelowMinimum,
+    #[msg("Fee is above the configured maximum or the hard cap")]
+    FeeAboveMaximum,
+    #[msg("Account is not a migratable Config image")]
+    InvalidConfigAccount,
 }

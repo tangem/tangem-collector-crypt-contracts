@@ -7,7 +7,7 @@
 //! come back green and a new assertion can "pass" against code that was never
 //! compiled. `program_so_path` fails loudly instead.
 //!
-//! Shared by all five suites, but not every suite uses every helper (only
+//! Shared by all six suites, but not every suite uses every helper (only
 //! sweep.rs, core.rs and pnft.rs decode events), so the unused-item lint is
 //! off for this module.
 #![allow(dead_code)]

@@ -87,7 +87,7 @@ function coreTransferIx(payer, authority, newOwner) {
     // Inside try: if the swap's rpc() times out but the transaction lands
     // anyway, the finally block still restores the real wallet.
     await program.methods
-      .updateConfig(null, player.publicKey, null, null, null, null, null)
+      .updateConfig(null, player.publicKey, null, null, null, null, null, null)
       .accountsPartial({ config: configPda, admin: player.publicKey })
       .signers([player])
       .rpc();
@@ -122,7 +122,7 @@ function coreTransferIx(payer, authority, newOwner) {
       .accountsPartial({
         config: configPda,
         vault: vaultPda,
-        hotDelegate: player.publicKey,
+        sessionKey: player.publicKey,
         ccAuthority: player.publicKey,
         destinationOwner: prizeWallet.publicKey,
         usdcMint: USDC,
@@ -176,7 +176,7 @@ function coreTransferIx(payer, authority, newOwner) {
     // original error (or eat a successful run's signature).
     try {
       await program.methods
-        .updateConfig(null, RESTORE_GACHA, null, null, null, null, null)
+        .updateConfig(null, RESTORE_GACHA, null, null, null, null, null, null)
         .accountsPartial({ config: configPda, admin: player.publicKey })
         .signers([player])
         .rpc();

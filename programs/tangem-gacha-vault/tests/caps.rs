@@ -1,4 +1,4 @@
-//! Spending-cap and input-guard tests for open_pack / withdraw_token on real
+//! Spending-cap and input-guard tests for purchase_pack / withdraw_token on real
 //! bytecode (LiteSVM), incl. the UTC-day rollover exercised by warping the
 //! Clock sysvar — the only place the roll_day path runs (no other test
 //! advances the calendar).
@@ -25,7 +25,7 @@ const PROGRAM_ID: Pubkey = tangem_gacha_vault::ID;
 const TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const ATA_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const SECONDS_PER_DAY: i64 = 86_400;
-const D: u64 = 300_000_000; // per_spin_cap == daily_cap (fee_bps = 0)
+const D: u64 = 300_000_000; // per_spin_cap == daily_cap (min_fee_bps = 0 and fee_amount = 0)
 
 fn ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
@@ -157,7 +157,7 @@ fn setup() -> World {
     let fee_usdc = create_ata(&mut svm, &payer, &fee_owner.pubkey(), &mint);
 
     // Config written directly (initialize_config's upgrade-authority gate needs
-    // ProgramData, which litesvm's add_program does not create); fee_bps = 0.
+    // ProgramData, which litesvm's add_program does not create); min_fee_bps = 0 and fee_amount = 0.
     let (config, bump) = Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID);
     let cfg = Config {
         admin: Pubkey::new_unique(),
@@ -165,9 +165,10 @@ fn setup() -> World {
         gacha_wallet: gacha_owner.pubkey(),
         gacha_usdc_account: gacha_usdc,
         fee_usdc_account: fee_usdc,
-        fee_bps: 0,
+        min_fee_bps: 0,
+        max_fee_bps: 1_000,
         paused: false,
-        _reserved: false,
+        _reserved: 0,
         allow_buyback_delegation: false,
         bump,
     };
@@ -184,12 +185,12 @@ fn setup() -> World {
         program_id: PROGRAM_ID,
         accounts: accounts::InitVault {
             vault,
-            cold_owner: cold.pubkey(),
+            owner: cold.pubkey(),
             payer: payer.pubkey(),
             system_program: system_program::ID,
         }
         .to_account_metas(None),
-        data: instruction::InitVault { hot_delegate: hot.pubkey(), per_spin_cap: D, daily_cap: D }.data(),
+        data: instruction::InitVault { session_key: hot.pubkey(), per_spin_cap: D, daily_cap: D }.data(),
     };
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -212,9 +213,10 @@ fn set_config(w: &mut World, gacha_usdc_account: Pubkey, fee_usdc_account: Pubke
         gacha_wallet: Pubkey::new_unique(),
         gacha_usdc_account,
         fee_usdc_account,
-        fee_bps: 0,
+        min_fee_bps: 0,
+        max_fee_bps: 1_000,
         paused: false,
-        _reserved: false,
+        _reserved: 0,
         allow_buyback_delegation: false,
         bump,
     };
@@ -238,10 +240,10 @@ fn send_spin(w: &mut World, amount: u64, tag: u8) -> Result<(), String> {
 fn send_spin_memo(w: &mut World, amount: u64, memo: String) -> Result<(), String> {
     let ix = Instruction {
         program_id: PROGRAM_ID,
-        accounts: accounts::OpenPack {
+        accounts: accounts::PurchasePack {
             config: w.config,
             vault: w.vault,
-            hot_delegate: w.hot.pubkey(),
+            session_key: w.hot.pubkey(),
             usdc_mint: w.mint,
             vault_usdc: w.vault_usdc,
             gacha_usdc: w.gacha_usdc,
@@ -249,7 +251,7 @@ fn send_spin_memo(w: &mut World, amount: u64, memo: String) -> Result<(), String
             token_program: TOKEN_PROGRAM_ID,
         }
         .to_account_metas(None),
-        data: instruction::OpenPack { amount, memo }.data(),
+        data: instruction::PurchasePack { amount, fee_amount: 0, memo }.data(),
     };
     w.svm.expire_blockhash();
     let tx = Transaction::new_signed_with_payer(
@@ -317,7 +319,7 @@ fn zero_amount_spin_rejected() {
 }
 
 /// A wrong-mint treasury in the config must fail the FIRST spin loudly — even
-/// at fee_bps = 0, when no fee transfer would touch the account. Without the
+/// at min_fee_bps = 0 and fee_amount = 0, when no fee transfer would touch the account. Without the
 /// `token::mint` pin this misconfiguration passes silently until the fee is
 /// raised, then breaks every spin of every vault at once.
 #[test]
@@ -365,7 +367,7 @@ fn send_withdraw(w: &mut World, destination: Pubkey, amount: u64) -> Result<(), 
         program_id: PROGRAM_ID,
         accounts: accounts::WithdrawToken {
             vault: w.vault,
-            cold_owner: w.cold.pubkey(),
+            owner: w.cold.pubkey(),
             source: w.vault_usdc,
             mint: w.mint,
             destination,

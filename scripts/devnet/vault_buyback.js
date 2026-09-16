@@ -12,7 +12,7 @@
 //      instruction ARGUMENT (not the API quote), and refuse any transaction
 //      carrying an instruction of this program other than the one buyback it
 //      is showing. On devnet the blast radius is hidden because `player` is
-//      simultaneously cold_owner and hot_delegate — on mainnet it is not.
+//      simultaneously owner and session_key — on mainnet it is not.
 //
 // Full buyback e2e for a vault-held pNFT prize:
 //   approve_buyback (hot becomes the TM transfer delegate, slot occupied)
@@ -54,7 +54,7 @@ async function main() {
 
   console.log("[1] approve_buyback (hot -> TM transfer delegate)");
   const sig1 = await program.methods.approveBuyback().accountsPartial({
-    config: configPda, vault: vaultPda, hotDelegate: player.publicKey,
+    config: configPda, vault: vaultPda, sessionKey: player.publicKey,
     nftMint: NFT, nftToken, metadata, edition, tokenRecord,
     authorizationRules: RULE_SET, authorizationRulesProgram: AUTH_RULES_PROG,
     tokenMetadataProgram: TM, sysvarInstructions: SYSVAR_IX,
@@ -89,9 +89,9 @@ async function main() {
   }).rpc();
   console.log("  sig:", sig3);
 
-  console.log("[5] close_token_account (cold; rent -> cold owner)");
+  console.log("[5] close_token_account (owner; rent -> owner)");
   const sig4 = await program.methods.closeTokenAccount().accountsPartial({
-    vault: vaultPda, coldOwner: player.publicKey, token: nftToken, tokenProgram: TOKEN_PROG,
+    vault: vaultPda, owner: player.publicKey, token: nftToken, tokenProgram: TOKEN_PROG,
   }).rpc();
   console.log("  sig:", sig4);
 

@@ -144,9 +144,10 @@ fn setup() -> World {
         gacha_wallet,
         gacha_usdc_account: Pubkey::new_unique(),
         fee_usdc_account: Pubkey::new_unique(),
-        fee_bps: 0,
+        min_fee_bps: 0,
+        max_fee_bps: 1_000,
         paused: false,
-        _reserved: false,
+        _reserved: 0,
         allow_buyback_delegation: false,
         bump,
     };
@@ -163,13 +164,13 @@ fn setup() -> World {
         program_id: PROGRAM_ID,
         accounts: accounts::InitVault {
             vault,
-            cold_owner: cold.pubkey(),
+            owner: cold.pubkey(),
             payer: payer.pubkey(),
             system_program: system_program::ID,
         }
         .to_account_metas(None),
         data: instruction::InitVault {
-            hot_delegate: hot.pubkey(),
+            session_key: hot.pubkey(),
             per_spin_cap: 1,
             daily_cap: 1,
         }
@@ -351,7 +352,7 @@ fn sweep_clears_a_delegated_empty_ata_that_close_token_account_refuses() {
         program_id: PROGRAM_ID,
         accounts: accounts::CloseTokenAccountCtx {
             vault: w.vault,
-            cold_owner: w.cold.pubkey(),
+            owner: w.cold.pubkey(),
             token: prize_ata,
             token_program: TOKEN_PROGRAM_ID,
         }
@@ -424,7 +425,7 @@ fn sweep_rejects_live_buyback_token() {
         program_id: PROGRAM_ID,
         accounts: accounts::CloseTokenAccountCtx {
             vault: w.vault,
-            cold_owner: w.cold.pubkey(),
+            owner: w.cold.pubkey(),
             token: prize_ata,
             token_program: TOKEN_PROGRAM_ID,
         }

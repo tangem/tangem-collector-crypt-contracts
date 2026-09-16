@@ -111,13 +111,13 @@ fn setup() -> World {
         program_id: PROGRAM_ID,
         accounts: accounts::InitVault {
             vault,
-            cold_owner: cold.pubkey(),
+            owner: cold.pubkey(),
             payer: payer.pubkey(),
             system_program: system_program::ID,
         }
         .to_account_metas(None),
         data: instruction::InitVault {
-            hot_delegate: hot.pubkey(),
+            session_key: hot.pubkey(),
             per_spin_cap: 300_000_000,
             daily_cap: 1_000_000_000,
         }
@@ -139,7 +139,7 @@ fn withdraw_ix(w: &World, destination: Pubkey) -> Instruction {
         program_id: PROGRAM_ID,
         accounts: accounts::WithdrawCore {
             vault: w.vault,
-            cold_owner: w.cold.pubkey(),
+            owner: w.cold.pubkey(),
             payer: w.payer.pubkey(),
             asset: CC_CORE_ASSET,
             collection: CC_CORE_COLLECTION,
@@ -176,7 +176,7 @@ fn withdraw_core_moves_real_cc_asset_to_cold_wallet() {
 fn withdraw_core_rejects_non_cold_signer() {
     let mut w = setup();
     let mut ix = withdraw_ix(&w, w.hot.pubkey());
-    ix.accounts[1].pubkey = w.hot.pubkey(); // impostor in the cold_owner slot
+    ix.accounts[1].pubkey = w.hot.pubkey(); // impostor in the owner slot
     let tx = Transaction::new_signed_with_payer(
         &[ix],
         Some(&w.payer.pubkey()),
@@ -286,9 +286,10 @@ fn install_usdc_world(w: &mut World, cc: &Keypair) -> (Pubkey, Pubkey, Pubkey, P
         gacha_wallet: cc.pubkey(),
         gacha_usdc_account: Pubkey::new_unique(),
         fee_usdc_account: Pubkey::new_unique(),
-        fee_bps: 0,
+        min_fee_bps: 0,
+        max_fee_bps: 1_000,
         paused: false,
-        _reserved: false,
+        _reserved: 0,
         allow_buyback_delegation: true,
         bump,
     };
@@ -426,7 +427,7 @@ fn buyback_core_ix(
         accounts: accounts::BuybackCore {
             config,
             vault: w.vault,
-            hot_delegate: w.hot.pubkey(),
+            session_key: w.hot.pubkey(),
             cc_authority: cc.pubkey(),
             destination_owner,
             usdc_mint,
@@ -688,9 +689,10 @@ fn buyback_core_rejects_paused_and_zero_price() {
         gacha_wallet: cc.pubkey(),
         gacha_usdc_account: Pubkey::new_unique(),
         fee_usdc_account: Pubkey::new_unique(),
-        fee_bps: 0,
+        min_fee_bps: 0,
+        max_fee_bps: 1_000,
         paused: true,
-        _reserved: false,
+        _reserved: 0,
         allow_buyback_delegation: true,
         bump,
     };

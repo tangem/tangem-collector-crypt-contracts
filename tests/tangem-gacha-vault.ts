@@ -30,9 +30,20 @@ describe("tangem-gacha-vault", () => {
   const admin = (provider.wallet as anchor.Wallet).payer;
 
   // Actors
-  const coldOwner = Keypair.generate(); // simulates the Tangem card key
+  const owner = Keypair.generate(); // simulates the Tangem card key
   const coldOwner2 = Keypair.generate(); // second vault for daily-cap test
-  const hotDelegate = Keypair.generate(); // simulates the phone key
+  const sessionKey2 = Keypair.generate(); // rotated-in session key of the second vault
+  // Field names of an IDL struct type, normalized to snake_case: Anchor's
+  // Program converts the loaded IDL (type and field names) to camelCase.
+  const snake = (n: string) => n.replace(/[A-Z]/g, (m) => "_" + m.toLowerCase());
+  const idlStructFields = (typeName: string): string[] => {
+    const t = (program.idl as any).types.find(
+      (x: any) => x.name.toLowerCase() === typeName.toLowerCase()
+    );
+    assert.ok(t, `IDL type ${typeName} not found`);
+    return (t.type.fields as any[]).map((f) => snake(f.name));
+  };
+  const sessionKey = Keypair.generate(); // simulates the phone key
   const gachaWallet = Keypair.generate(); // simulates Collector Crypt treasury
   const feeTreasury = Keypair.generate(); // Tangem fee wallet
   const attacker = Keypair.generate();
@@ -51,7 +62,10 @@ describe("tangem-gacha-vault", () => {
   let vaultUsdc: PublicKey;
   let vault2Usdc: PublicKey;
 
-  const FEE_BPS = 100; // 1% on top
+  const FEE_BPS = 100; // 1% on top — corridor floor (min_fee_bps)
+  const MAX_FEE_BPS_CFG = 500; // corridor ceiling (max_fee_bps), admin-set
+  // What a compliant backend sends as fee_amount: floor(amount * rate / 10_000).
+  const feeFor = (a: anchor.BN) => a.muln(FEE_BPS).divn(10_000);
   const PER_SPIN_CAP = usd(300); // covers a 250 USDC pack + fee
   const DAILY_CAP = usd(1000);
 
@@ -59,9 +73,25 @@ describe("tangem-gacha-vault", () => {
   // backend; the API field is the bare join key).
   const memo = (uuid: string) => `tangem-${uuid}:open`;
 
+  // Decode the program's Anchor events from a confirmed transaction's logs —
+  // deterministic, unlike addEventListener on a local validator.
+  const eventsOf = async (sig: string) => {
+    let tx = null;
+    for (let i = 0; i < 40 && !tx; i++) {
+      tx = await connection.getTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (!tx) await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.ok(tx, `transaction ${sig} not found`);
+    const parser = new anchor.EventParser(program.programId, program.coder);
+    return [...parser.parseLogs(tx!.meta!.logMessages ?? [])];
+  };
+
   before(async () => {
     await Promise.all(
-      [coldOwner, coldOwner2, hotDelegate, gachaWallet, attacker].map(
+      [owner, coldOwner2, sessionKey, gachaWallet, attacker].map(
         async (kp) => {
           const sig = await connection.requestAirdrop(
             kp.publicKey,
@@ -108,7 +138,7 @@ describe("tangem-gacha-vault", () => {
       BPF_UPGRADEABLE_LOADER
     );
     [vaultPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("vault"), coldOwner.publicKey.toBuffer()],
+      [Buffer.from("vault"), owner.publicKey.toBuffer()],
       program.programId
     );
     [vault2Pda] = PublicKey.findProgramAddressSync(
@@ -129,6 +159,7 @@ describe("tangem-gacha-vault", () => {
           gachaUsdc,
           feeUsdc,
           FEE_BPS,
+          MAX_FEE_BPS_CFG,
           true
         )
         .accountsPartial({
@@ -156,6 +187,7 @@ describe("tangem-gacha-vault", () => {
         gachaUsdc,
         feeUsdc,
         FEE_BPS,
+        MAX_FEE_BPS_CFG,
         true // buyback delegation on
       )
       .accountsPartial({
@@ -170,25 +202,26 @@ describe("tangem-gacha-vault", () => {
 
     const cfg = await program.account.config.fetch(configPda);
     assert.ok(cfg.gachaUsdcAccount.equals(gachaUsdc));
-    assert.equal(cfg.feeBps, FEE_BPS);
+    assert.equal(cfg.minFeeBps, FEE_BPS);
+    assert.equal(cfg.maxFeeBps, MAX_FEE_BPS_CFG);
     assert.isTrue(cfg.allowBuybackDelegation);
   });
 
   it("initializes a vault (cold signs, hot pays rent) and funds it", async () => {
     await program.methods
-      .initVault(hotDelegate.publicKey, PER_SPIN_CAP, DAILY_CAP)
+      .initVault(sessionKey.publicKey, PER_SPIN_CAP, DAILY_CAP)
       .accountsPartial({
         vault: vaultPda,
-        coldOwner: coldOwner.publicKey,
-        payer: hotDelegate.publicKey,
+        owner: owner.publicKey,
+        payer: sessionKey.publicKey,
         systemProgram: SystemProgram.programId,
       })
-      .signers([coldOwner, hotDelegate])
+      .signers([owner, sessionKey])
       .rpc();
 
     const vault = await program.account.vault.fetch(vaultPda);
-    assert.ok(vault.coldOwner.equals(coldOwner.publicKey));
-    assert.ok(vault.hotDelegate.equals(hotDelegate.publicKey));
+    assert.ok(vault.owner.equals(owner.publicKey));
+    assert.ok(vault.sessionKey.equals(sessionKey.publicKey));
     assert.isNull(vault.liveBuybackMint);
 
     // Deposit: in production a plain SPL transfer signed by the cold key
@@ -206,20 +239,20 @@ describe("tangem-gacha-vault", () => {
     await mintTo(connection, admin, usdcMint, vaultUsdc, admin, 500_000_000); // 500 USDC
   });
 
-  it("open_pack: pays gacha + fee with memo, signed only by hot key", async () => {
+  it("purchase_pack: pays gacha + fee with memo, signed only by hot key", async () => {
     await program.methods
-      .openPack(usd(50), memo("11111111-aaaa-bbbb-cccc-000000000001"))
+      .purchasePack(usd(50), feeFor(usd(50)), memo("11111111-aaaa-bbbb-cccc-000000000001"))
       .accountsPartial({
         config: configPda,
         vault: vaultPda,
-        hotDelegate: hotDelegate.publicKey,
+        sessionKey: sessionKey.publicKey,
         usdcMint,
         vaultUsdc,
         gachaUsdc,
         feeUsdc,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
-      .signers([hotDelegate])
+      .signers([sessionKey])
       .rpc();
 
     const gacha = await getAccount(connection, gachaUsdc);
@@ -231,21 +264,21 @@ describe("tangem-gacha-vault", () => {
     assert.equal(vault.spentToday.toString(), usd(50.5).toString());
   });
 
-  it("open_pack: rejects a non-whitelisted destination", async () => {
+  it("purchase_pack: rejects a non-whitelisted destination", async () => {
     try {
       await program.methods
-        .openPack(usd(10), memo("11111111-aaaa-bbbb-cccc-000000000002"))
+        .purchasePack(usd(10), feeFor(usd(10)), memo("11111111-aaaa-bbbb-cccc-000000000002"))
         .accountsPartial({
           config: configPda,
           vault: vaultPda,
-          hotDelegate: hotDelegate.publicKey,
+          sessionKey: sessionKey.publicKey,
           usdcMint,
           vaultUsdc,
           gachaUsdc: attackerUsdc, // <-- attacker swaps destination
           feeUsdc,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
-        .signers([hotDelegate])
+        .signers([sessionKey])
         .rpc();
       assert.fail("should have thrown");
     } catch (e: any) {
@@ -253,14 +286,14 @@ describe("tangem-gacha-vault", () => {
     }
   });
 
-  it("open_pack: rejects a non-delegate signer", async () => {
+  it("purchase_pack: rejects a non-delegate signer", async () => {
     try {
       await program.methods
-        .openPack(usd(10), memo("11111111-aaaa-bbbb-cccc-000000000003"))
+        .purchasePack(usd(10), feeFor(usd(10)), memo("11111111-aaaa-bbbb-cccc-000000000003"))
         .accountsPartial({
           config: configPda,
           vault: vaultPda,
-          hotDelegate: attacker.publicKey,
+          sessionKey: attacker.publicKey,
           usdcMint,
           vaultUsdc,
           gachaUsdc,
@@ -275,23 +308,116 @@ describe("tangem-gacha-vault", () => {
     }
   });
 
-  it("open_pack: per-spin cap is fee-inclusive (fee pushes total over)", async () => {
-    // 299 alone fits the 300 cap; 299 + 1% fee = 301.99 must be refused.
-    // (The bare above-cap case is covered by caps.rs::per_spin_cap_enforced.)
+  it("purchase_pack: fee below the corridor floor is rejected (FeeBelowMinimum)", async () => {
+    // floor(50 USDC * 1%) = 0.5 USDC; one base unit less is under the floor.
+    const amount = usd(50);
+    const fee = feeFor(amount).subn(1);
+    assert.isTrue(feeFor(amount).gtn(0)); // floor(min) > 0 for this amount
     try {
       await program.methods
-        .openPack(usd(299), memo("11111111-aaaa-bbbb-cccc-000000000004"))
+        .purchasePack(amount, fee, memo("11111111-aaaa-bbbb-cccc-000000000006"))
         .accountsPartial({
           config: configPda,
           vault: vaultPda,
-          hotDelegate: hotDelegate.publicKey,
+          sessionKey: sessionKey.publicKey,
           usdcMint,
           vaultUsdc,
           gachaUsdc,
           feeUsdc,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
-        .signers([hotDelegate])
+        .signers([sessionKey])
+        .rpc();
+      assert.fail("should have thrown");
+    } catch (e: any) {
+      assert.include(e.toString(), "FeeBelowMinimum");
+    }
+  });
+
+  it("purchase_pack: fee above the corridor ceiling is rejected (FeeAboveMaximum)", async () => {
+    // max_fee_bps = 5%: 50 USDC * 5% = 2.5 USDC; one base unit more breaks
+    // fee * 10_000 <= amount * max_fee_bps (exact cross-multiplication).
+    const amount = usd(50);
+    const fee = amount.muln(MAX_FEE_BPS_CFG).divn(10_000).addn(1);
+    try {
+      await program.methods
+        .purchasePack(amount, fee, memo("11111111-aaaa-bbbb-cccc-000000000007"))
+        .accountsPartial({
+          config: configPda,
+          vault: vaultPda,
+          sessionKey: sessionKey.publicKey,
+          usdcMint,
+          vaultUsdc,
+          gachaUsdc,
+          feeUsdc,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([sessionKey])
+        .rpc();
+      assert.fail("should have thrown");
+    } catch (e: any) {
+      assert.include(e.toString(), "FeeAboveMaximum");
+    }
+  });
+
+  it("purchase_pack: fee exactly at the corridor ceiling passes, PackOpened carries owner + fee", async () => {
+    // 20 USDC * 5% = 1 USDC — the boundary itself must be accepted.
+    const amount = usd(20);
+    const fee = amount.muln(MAX_FEE_BPS_CFG).divn(10_000);
+    const m = memo("11111111-aaaa-bbbb-cccc-000000000008");
+    const gachaBefore = (await getAccount(connection, gachaUsdc)).amount;
+    const feeBefore = (await getAccount(connection, feeUsdc)).amount;
+    const sig = await program.methods
+      .purchasePack(amount, fee, m)
+      .accountsPartial({
+        config: configPda,
+        vault: vaultPda,
+        sessionKey: sessionKey.publicKey,
+        usdcMint,
+        vaultUsdc,
+        gachaUsdc,
+        feeUsdc,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([sessionKey])
+      .rpc({ commitment: "confirmed" });
+
+    const gachaAfter = (await getAccount(connection, gachaUsdc)).amount;
+    const feeAfter = (await getAccount(connection, feeUsdc)).amount;
+    assert.equal((gachaAfter - gachaBefore).toString(), amount.toString());
+    assert.equal((feeAfter - feeBefore).toString(), fee.toString());
+
+    const opened = (await eventsOf(sig)).find((e) => e.name === "packOpened");
+    assert.ok(opened, "PackOpened not emitted");
+    assert.ok((opened!.data.vault as PublicKey).equals(vaultPda));
+    assert.ok((opened!.data.owner as PublicKey).equals(owner.publicKey)); // was cold_owner
+    // The rename is pinned at the IDL level (a decoder can only ever produce
+    // names that exist in the IDL, so asserting on decoded data would be vacuous).
+    const packOpenedFields = idlStructFields("PackOpened");
+    assert.include(packOpenedFields, "owner");
+    assert.notInclude(packOpenedFields, "cold_owner");
+    assert.equal(opened!.data.amount.toString(), amount.toString());
+    assert.equal(opened!.data.fee.toString(), fee.toString());
+    assert.equal(opened!.data.memo, m);
+  });
+
+  it("purchase_pack: per-spin cap is fee-inclusive (fee pushes total over)", async () => {
+    // 299 alone fits the 300 cap; 299 + 1% fee = 301.99 must be refused.
+    // (The bare above-cap case is covered by caps.rs::per_spin_cap_enforced.)
+    try {
+      await program.methods
+        .purchasePack(usd(299), feeFor(usd(299)), memo("11111111-aaaa-bbbb-cccc-000000000004"))
+        .accountsPartial({
+          config: configPda,
+          vault: vaultPda,
+          sessionKey: sessionKey.publicKey,
+          usdcMint,
+          vaultUsdc,
+          gachaUsdc,
+          feeUsdc,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([sessionKey])
         .rpc();
       assert.fail("should have thrown");
     } catch (e: any) {
@@ -299,16 +425,16 @@ describe("tangem-gacha-vault", () => {
     }
   });
 
-  it("open_pack: enforces the daily cap (second vault, tight caps)", async () => {
+  it("purchase_pack: enforces the daily cap (second vault, tight caps)", async () => {
     await program.methods
-      .initVault(hotDelegate.publicKey, usd(100 * 1.01), usd(150))
+      .initVault(sessionKey.publicKey, usd(100 * 1.01), usd(150))
       .accountsPartial({
         vault: vault2Pda,
-        coldOwner: coldOwner2.publicKey,
-        payer: hotDelegate.publicKey,
+        owner: coldOwner2.publicKey,
+        payer: sessionKey.publicKey,
         systemProgram: SystemProgram.programId,
       })
-      .signers([coldOwner2, hotDelegate])
+      .signers([coldOwner2, sessionKey])
       .rpc();
     await createAssociatedTokenAccount(
       connection,
@@ -324,18 +450,18 @@ describe("tangem-gacha-vault", () => {
 
     const spin = (uuid: string, amount: anchor.BN) =>
       program.methods
-        .openPack(amount, memo(uuid))
+        .purchasePack(amount, feeFor(amount), memo(uuid))
         .accountsPartial({
           config: configPda,
           vault: vault2Pda,
-          hotDelegate: hotDelegate.publicKey,
+          sessionKey: sessionKey.publicKey,
           usdcMint,
           vaultUsdc: vault2Usdc,
           gachaUsdc,
           feeUsdc,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
-        .signers([hotDelegate])
+        .signers([sessionKey])
         .rpc();
 
     // 100 + 1% fee = 101 charged; next 50-spin needs 50.5 more > 150 cap.
@@ -345,6 +471,56 @@ describe("tangem-gacha-vault", () => {
       assert.fail("should have thrown");
     } catch (e: any) {
       assert.include(e.toString(), "ExceedsDailyCap");
+    }
+  });
+
+  it("update_vault: owner rotates the session key and SessionKeyRotated is emitted", async () => {
+    const sig = await program.methods
+      .updateVault(sessionKey2.publicKey, null, null)
+      .accountsPartial({ vault: vault2Pda, owner: coldOwner2.publicKey })
+      .signers([coldOwner2])
+      .rpc({ commitment: "confirmed" });
+
+    const vault = await program.account.vault.fetch(vault2Pda);
+    assert.ok(vault.sessionKey.equals(sessionKey2.publicKey));
+
+    const events = await eventsOf(sig);
+    const rotated = events.find((e) => e.name === "sessionKeyRotated");
+    assert.ok(
+      rotated,
+      `SessionKeyRotated not emitted, got: ${events.map((e) => e.name).join(",")}`
+    );
+    // Old event name gone — pinned at the IDL level.
+    assert.notInclude(
+      (program.idl as any).events.map((e: any) => e.name.toLowerCase()),
+      "hotdelegaterotated"
+    );
+    assert.ok((rotated!.data.vault as PublicKey).equals(vault2Pda));
+    assert.ok((rotated!.data.sessionKey as PublicKey).equals(sessionKey2.publicKey));
+    assert.deepEqual(idlStructFields("SessionKeyRotated"), ["vault", "session_key"]);
+
+    // Caps-only update: no rotation event.
+    const sig2 = await program.methods
+      .updateVault(null, null, usd(200))
+      .accountsPartial({ vault: vault2Pda, owner: coldOwner2.publicKey })
+      .signers([coldOwner2])
+      .rpc({ commitment: "confirmed" });
+    assert.isUndefined(
+      (await eventsOf(sig2)).find((e) => e.name === "sessionKeyRotated")
+    );
+  });
+
+  it("update_vault: the session key cannot rotate itself", async () => {
+    // sessionKey2 is vault2's CURRENT session key after the rotation above.
+    try {
+      await program.methods
+        .updateVault(attacker.publicKey, null, null)
+        .accountsPartial({ vault: vault2Pda, owner: sessionKey2.publicKey })
+        .signers([sessionKey2])
+        .rpc();
+      assert.fail("should have thrown");
+    } catch (e: any) {
+      assert.include(e.toString(), "ConstraintSeeds");
     }
   });
 
@@ -362,7 +538,7 @@ describe("tangem-gacha-vault", () => {
     // the hermetic TS suite covers the happy path on the idle second vault.
     await program.methods
       .closeVault()
-      .accountsPartial({ vault: vault2Pda, coldOwner: coldOwner2.publicKey })
+      .accountsPartial({ vault: vault2Pda, owner: coldOwner2.publicKey })
       .signers([coldOwner2])
       .rpc();
     assert.isNull(await program.account.vault.fetchNullable(vault2Pda));
@@ -374,17 +550,17 @@ describe("tangem-gacha-vault", () => {
         .withdrawToken(usd(1))
         .accountsPartial({
           vault: vaultPda,
-          coldOwner: hotDelegate.publicKey, // wrong authority
+          owner: sessionKey.publicKey, // wrong authority
           source: vaultUsdc,
           mint: usdcMint,
           destination: attackerUsdc,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
-        .signers([hotDelegate])
+        .signers([sessionKey])
         .rpc();
       assert.fail("should have thrown");
     } catch (e: any) {
-      // vault PDA seeds derive from cold_owner, so a wrong signer breaks them
+      // vault PDA seeds derive from owner, so a wrong signer breaks them
       assert.include(e.toString(), "ConstraintSeeds");
     }
   });
@@ -394,19 +570,19 @@ describe("tangem-gacha-vault", () => {
       connection,
       admin,
       usdcMint,
-      coldOwner.publicKey
+      owner.publicKey
     );
     await program.methods
       .withdrawToken(usd(100))
       .accountsPartial({
         vault: vaultPda,
-        coldOwner: coldOwner.publicKey,
+        owner: owner.publicKey,
         source: vaultUsdc,
         mint: usdcMint,
         destination: coldUsdc,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
-      .signers([coldOwner])
+      .signers([owner])
       .rpc();
     const acc = await getAccount(connection, coldUsdc);
     assert.equal(acc.amount.toString(), usd(100).toString());
@@ -426,20 +602,20 @@ describe("tangem-gacha-vault", () => {
       true
     );
 
-    const before = await connection.getBalance(coldOwner.publicKey);
+    const before = await connection.getBalance(owner.publicKey);
     await program.methods
       .closeTokenAccount()
       .accountsPartial({
         vault: vaultPda,
-        coldOwner: coldOwner.publicKey,
+        owner: owner.publicKey,
         token: junkAta,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
-      .signers([coldOwner])
+      .signers([owner])
       .rpc();
 
     assert.isNull(await connection.getAccountInfo(junkAta));
-    const after = await connection.getBalance(coldOwner.publicKey);
+    const after = await connection.getBalance(owner.publicKey);
     assert.isAbove(after, before); // rent came back (minus tx fee paid by provider)
   });
 
@@ -455,10 +631,10 @@ describe("tangem-gacha-vault", () => {
       .withdrawSol(new anchor.BN(0.1 * LAMPORTS_PER_SOL))
       .accountsPartial({
         vault: vaultPda,
-        coldOwner: coldOwner.publicKey,
-        recipient: coldOwner.publicKey,
+        owner: owner.publicKey,
+        recipient: owner.publicKey,
       })
-      .signers([coldOwner])
+      .signers([owner])
       .rpc();
 
     try {
@@ -466,10 +642,10 @@ describe("tangem-gacha-vault", () => {
         .withdrawSol(new anchor.BN(LAMPORTS_PER_SOL)) // more than remains above rent
         .accountsPartial({
           vault: vaultPda,
-          coldOwner: coldOwner.publicKey,
-          recipient: coldOwner.publicKey,
+          owner: owner.publicKey,
+          recipient: owner.publicKey,
         })
-        .signers([coldOwner])
+        .signers([owner])
         .rpc();
       assert.fail("should have thrown");
     } catch (e: any) {
@@ -483,10 +659,10 @@ describe("tangem-gacha-vault", () => {
         .withdrawSol(new anchor.BN(0))
         .accountsPartial({
           vault: vaultPda,
-          coldOwner: coldOwner.publicKey,
-          recipient: coldOwner.publicKey,
+          owner: owner.publicKey,
+          recipient: owner.publicKey,
         })
-        .signers([coldOwner])
+        .signers([owner])
         .rpc();
       assert.fail("should have thrown");
     } catch (e: any) {
@@ -500,10 +676,10 @@ describe("tangem-gacha-vault", () => {
         .withdrawSol(new anchor.BN(1))
         .accountsPartial({
           vault: vaultPda,
-          coldOwner: coldOwner.publicKey,
+          owner: owner.publicKey,
           recipient: vaultPda,
         })
-        .signers([coldOwner])
+        .signers([owner])
         .rpc();
       assert.fail("should have thrown");
     } catch (e: any) {
@@ -511,25 +687,25 @@ describe("tangem-gacha-vault", () => {
     }
   });
 
-  it("pause blocks open_pack", async () => {
+  it("pause blocks purchase_pack", async () => {
     await program.methods
-      .updateConfig(null, null, null, null, null, true, null)
+      .updateConfig(null, null, null, null, null, null, true, null)
       .accountsPartial({ config: configPda, admin: admin.publicKey })
       .rpc();
     try {
       await program.methods
-        .openPack(usd(10), memo("11111111-aaaa-bbbb-cccc-000000000005"))
+        .purchasePack(usd(10), feeFor(usd(10)), memo("11111111-aaaa-bbbb-cccc-000000000005"))
         .accountsPartial({
           config: configPda,
           vault: vaultPda,
-          hotDelegate: hotDelegate.publicKey,
+          sessionKey: sessionKey.publicKey,
           usdcMint,
           vaultUsdc,
           gachaUsdc,
           feeUsdc,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
-        .signers([hotDelegate])
+        .signers([sessionKey])
         .rpc();
       assert.fail("should have thrown");
     } catch (e: any) {
@@ -540,7 +716,7 @@ describe("tangem-gacha-vault", () => {
   it("update_config: non-admin is rejected", async () => {
     try {
       await program.methods
-        .updateConfig(null, null, null, null, null, false, null)
+        .updateConfig(null, null, null, null, null, null, false, null)
         .accountsPartial({ config: configPda, admin: attacker.publicKey })
         .signers([attacker])
         .rpc();
@@ -553,12 +729,38 @@ describe("tangem-gacha-vault", () => {
   it("update_config: fee above MAX_FEE_BPS is rejected", async () => {
     try {
       await program.methods
-        .updateConfig(null, null, null, null, 5000, null, null)
+        .updateConfig(null, null, null, null, null, 5000, null, null)
         .accountsPartial({ config: configPda, admin: admin.publicKey })
         .rpc();
       assert.fail("should have thrown");
     } catch (e: any) {
       assert.include(e.toString(), "InvalidFeeBps");
     }
+  });
+
+  it("update_config: max_fee_bps below min_fee_bps is rejected", async () => {
+    // min stays 100 (1%); max = 50 would invert the corridor.
+    try {
+      await program.methods
+        .updateConfig(null, null, null, null, null, FEE_BPS - 50, null, null)
+        .accountsPartial({ config: configPda, admin: admin.publicKey })
+        .rpc();
+      assert.fail("should have thrown");
+    } catch (e: any) {
+      assert.include(e.toString(), "InvalidFeeBps");
+    }
+    // Raising min above the current max in one call fails the same way.
+    try {
+      await program.methods
+        .updateConfig(null, null, null, null, MAX_FEE_BPS_CFG + 1, null, null, null)
+        .accountsPartial({ config: configPda, admin: admin.publicKey })
+        .rpc();
+      assert.fail("should have thrown");
+    } catch (e: any) {
+      assert.include(e.toString(), "InvalidFeeBps");
+    }
+    const cfg = await program.account.config.fetch(configPda);
+    assert.equal(cfg.minFeeBps, FEE_BPS);
+    assert.equal(cfg.maxFeeBps, MAX_FEE_BPS_CFG);
   });
 });
