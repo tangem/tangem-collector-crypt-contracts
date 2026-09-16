@@ -14,15 +14,16 @@ Everything on our side is implemented and tested; the devnet program id is
 `29agFEruMu2jedVwnDgKPuq7ejmTiB7sEqzdhufQQS9u`. **This README describes the
 build in this repository** — `purchase_pack` with an explicit `fee_amount`,
 the admin-set fee corridor, `migrate_config`, the 176-byte `Config`, and the
-`owner` / `session_key` identifiers. **Devnet has NOT been redeployed with it
-yet:** the chain still runs the previous build (deployed 24-08-2026 at slot
-487301012, 174-byte `Config`, `open_pack`). The committed IDL at
-`idl/tangem_gacha_vault.json` matches this repository, so it is ahead of the
-chain until the redeploy; the deploy ritual, including the mandatory
-`migrate_config` call, is in "Devnet quickstart against CC".
+`owner` / `session_key` identifiers. **Deployed to devnet on 16-09-2026 at
+slot 499213881** (684 792-byte `.so`, sha256 `d86e9b80…`, verified
+byte-for-byte against the on-chain dump); `Config` was migrated in the same
+session (176 bytes, `min_fee_bps` 100, `max_fee_bps` 500). The committed IDL
+at `idl/tangem_gacha_vault.json` matches both this repository and the chain.
+The deploy ritual, including the mandatory `migrate_config` call, is in
+"Devnet quickstart against CC".
 
-**Product profile — "Day 1"** (decided 03-09-2026; both delivery addresses
-still to be confirmed by product):
+**Product profile — "Day 1"** (decided 03-09-2026, confirmed by product
+16-09-2026: launch without buybacks, both delivery addresses final):
 
 - The vault is a **USDC balance for spins**, nothing more. Prizes are
   delivered to the **owner (cold) wallet**: the backend passes
@@ -767,12 +768,11 @@ step for the live migration.
 
 ## Devnet quickstart against CC
 
-- Devnet program `29agFEruMu2jedVwnDgKPuq7ejmTiB7sEqzdhufQQS9u` still runs
-  the **previous** build (slot 487301012; 174-byte `Config`, `open_pack`);
-  the redeploy of this build is pending. The committed IDL at
-  `idl/tangem_gacha_vault.json` (regenerated into `target/idl` by
-  `anchor build`) describes THIS build — keep the committed copy in sync on
-  redeploys. The `Vault` layout (179 B) and the append-only error enum are
+- Devnet program `29agFEruMu2jedVwnDgKPuq7ejmTiB7sEqzdhufQQS9u` runs THIS
+  build since 16-09-2026 (slot 499213881; `Config` migrated to 176 bytes,
+  corridor 100/500 bps). The committed IDL at `idl/tangem_gacha_vault.json`
+  (regenerated into `target/idl` by `anchor build`) matches the chain — keep
+  the committed copy in sync on redeploys. The `Vault` layout (179 B) and the append-only error enum are
   the constraints on any change that must keep existing accounts valid; the
   `Config` layout is versioned by `migrate_config`.
 - **Deploy ritual for this build:**
