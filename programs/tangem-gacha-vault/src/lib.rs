@@ -952,7 +952,7 @@ pub mod tangem_gacha_vault {
     ///
     /// CLIENT CONTRACT — this instruction carries 27 accounts and does NOT fit
     /// a legacy transaction: 1383 bytes against the 1232-byte cap. Build a v0
-    /// transaction against CC's address lookup table (1016 bytes), prepend the
+    /// transaction against CC's address lookup table (1047 bytes), prepend the
     /// ed25519 quote instruction, request ~500k compute units, and create the
     /// vault's USDC ATA idempotently if it may not exist. Display the `price`
     /// ARGUMENT, not the quote the API rendered.
@@ -2066,7 +2066,7 @@ pub struct BuybackCore<'info> {
 
 /// 27 accounts, 1383 bytes as a legacy transaction against a 1232-byte cap. The
 /// client must build a v0 transaction against the address lookup table CC
-/// publishes, which brings it to 1016. See
+/// publishes, which brings it to 1047. See
 /// `buyback_pnft_v2_legacy_tx_is_over_budget` and
 /// `buyback_pnft_v2_v0_atomic_swap_and_packet_budget`, which pin both numbers so
 /// the dependency cannot regress silently.

@@ -19,7 +19,7 @@ Verified against devnet on **2026-09-16**.
 | Payment lane mint (devnet USDC, legacy SPL Token) | `Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr` |
 | Lane treasury (`treasury_token`) | `9ZSgA3PMjeAU8K6CWzgJ8oDnhZwwSgHZu6KP3X95t7Jq` |
 | SPL Memo (`memo_program`) | `MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr` |
-| Address lookup table (pNFT path) | `ErWJ8kwqb7RZKRwWgx1Kmfo65gqsqn2FXzKJTo7xz2jD` |
+| Address lookup table (pNFT path) | `HKv5pvGESQB7EQyzrypGyhJvP1YSn74uVx9mQWqEH9B8` (12 entries) |
 
 One lane only on devnet, so `payment_mint` is always the address above. The lane
 treasury is the same token account that receives `open_pack` payments: pack
@@ -70,11 +70,12 @@ with no `realloc` and no `close`, so deploying this branch over that account
 leaves every instruction failing `AccountDidNotDeserialize`.
 
 Cleanest route on devnet is a **fresh program id** for the v2 build, which also
-keeps the v1 path alive for comparison. Tell CC the new id when you have it: the
-lookup table's entry `[0]` is the config PDA of `29agFEru…`, and the table is
-deliberately **left unfrozen on devnet** so CC can append the new one. Entries
-are append-only, so nothing already indexed can be rewritten. A frozen table is
-a mainnet requirement, not a devnet one.
+keeps the v1 path alive for comparison. Nothing on CC's side has to change when
+you do that: the lookup table holds CC's constants only, so this program's config
+PDA travels in the transaction's static keys and a new program id costs 31 bytes,
+not a table amendment. (An earlier cut of the table did include the config PDA of
+`29agFEru…`; it was dropped for exactly this reason, since table entries are
+append-only and a frozen table could never have followed you.)
 
 Recreating vaults needs a `cold_owner` signature — a physical card tap per user
 — so plan the devnet test users around that.
@@ -84,7 +85,7 @@ Recreating vaults needs a `cold_owner` signature — a physical card tap per use
 | `nft_standard` | Instruction | Transaction | Compute | Rent leg |
 |---|---|---|---|---|
 | `core` | `buyback_core_v2` | legacy fits — 1046 bytes, 18 accounts | 250k | none — a Core asset owns no token account |
-| `pnft`, `nft` | `buyback_pnft_v2` | **v0 + the lookup table required** — 27 accounts, 1383 bytes legacy against the 1232-byte cap, 1016 with the table | 500k | 1,488,440 lamports back to `rent_destination`; the handler's `CloseAccount` on the emptied prize ATA already does it |
+| `pnft`, `nft` | `buyback_pnft_v2` | **v0 + the lookup table required** — 27 accounts, 1383 bytes legacy against the 1232-byte cap, 1047 with the table | 500k | 1,488,440 lamports back to `rent_destination`; the handler's `CloseAccount` on the emptied prize ATA already does it |
 | `cnft-core` | **not supported** | — | — | — |
 
 `cnft-core` is the real gap, and it is on this side: `cc_buyback` recognises a

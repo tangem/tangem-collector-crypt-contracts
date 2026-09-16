@@ -2033,12 +2033,12 @@ fn buyback_pnft_v2_v0_atomic_swap_and_packet_budget() {
     let p = mint_prize_to_vault(&mut w);
     let price = 10_000_000u64;
 
-    // Everything constant across every buyback goes in the table. The prize,
-    // the vault and the destination stay static: a new prize wallet must never
-    // require extending a frozen table.
+    // Mirrors CC's published table exactly: their constants only. The prize, the
+    // vault, the destination AND this program's config PDA stay static, so
+    // neither a new prize wallet nor a redeploy of this program can require
+    // extending a frozen table.
     let cc_op = w.cc_operator.pubkey();
     let alt = plant_alt(&mut w, &v, vec![
-        Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID).0,
         cc_op,
         v.usdc_mint,
         v.cc_usdc,
@@ -2111,7 +2111,6 @@ fn buyback_pnft_v2_rejects_rent_sent_to_the_wrong_wallet() {
 
     let cc_op = w.cc_operator.pubkey();
     let alt = plant_alt(&mut w, &v, vec![
-        Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID).0,
         cc_op,
         v.usdc_mint,
         v.cc_usdc,
@@ -2177,8 +2176,7 @@ fn buyback_pnft_v2_rejects_an_unlisted_destination() {
     let digest = cc_quote_digest(&w.vault, &p.mint, &v.destination, &v.usdc_mint, price, i64::MAX, 1, CC_BUYBACK_MEMO);
     let cc_op = w.cc_operator.pubkey();
     let alt = plant_alt(&mut w, &v, vec![
-        Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID).0, cc_op,
-        v.usdc_mint, v.cc_usdc, CC_RULE_SET, AUTH_RULES_PROGRAM_ID, mpl_token_metadata::ID,
+        cc_op, v.usdc_mint, v.cc_usdc, CC_RULE_SET, AUTH_RULES_PROGRAM_ID, mpl_token_metadata::ID,
         solana_sdk::sysvar::instructions::ID, ATA_PROGRAM_ID, CC_BUYBACK_ID, v.cc_policy,
         TOKEN_PROGRAM_ID, system_program::ID,
     ]);
