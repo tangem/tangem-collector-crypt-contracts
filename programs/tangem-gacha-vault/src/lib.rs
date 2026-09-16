@@ -950,11 +950,12 @@ pub mod tangem_gacha_vault {
     /// cc_buyback's own quote marker makes it spendable once. The phone is the
     /// only signer, and pays the fee and the Metaplex rent.
     ///
-    /// CLIENT CONTRACT — this instruction carries 24 accounts and does NOT fit
-    /// a legacy transaction. Build a v0 transaction against CC's frozen address
-    /// lookup table, prepend the ed25519 quote instruction, request ~500k
-    /// compute units, and create the vault's USDC ATA idempotently if it may
-    /// not exist. Display the `price` ARGUMENT, not the quote the API rendered.
+    /// CLIENT CONTRACT — this instruction carries 27 accounts and does NOT fit
+    /// a legacy transaction: 1383 bytes against the 1232-byte cap. Build a v0
+    /// transaction against CC's address lookup table (1016 bytes), prepend the
+    /// ed25519 quote instruction, request ~500k compute units, and create the
+    /// vault's USDC ATA idempotently if it may not exist. Display the `price`
+    /// ARGUMENT, not the quote the API rendered.
     pub fn buyback_pnft_v2(
         ctx: Context<BuybackPnftV2>,
         price: u64,
@@ -2063,10 +2064,12 @@ pub struct BuybackCore<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-/// 24 accounts. Does NOT fit a legacy transaction — the client must build a v0
-/// transaction with the frozen address lookup table CC publishes. See
-/// `buyback_pnft_v2_legacy_tx_is_over_budget`, which pins that fact so the
-/// dependency cannot regress silently.
+/// 27 accounts, 1383 bytes as a legacy transaction against a 1232-byte cap. The
+/// client must build a v0 transaction against the address lookup table CC
+/// publishes, which brings it to 1016. See
+/// `buyback_pnft_v2_legacy_tx_is_over_budget` and
+/// `buyback_pnft_v2_v0_atomic_swap_and_packet_budget`, which pin both numbers so
+/// the dependency cannot regress silently.
 ///
 /// As with BuybackCoreV2, `cc_authority` is no longer a signer: Collector Crypt
 /// signs a quote, not this transaction. It stays in the account list because
@@ -2161,7 +2164,7 @@ pub struct BuybackPnftV2<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// 15 accounts, fits a legacy transaction with room to spare.
+/// 18 accounts, 1046 bytes — fits a legacy transaction, no lookup table needed.
 ///
 /// Note what is ABSENT compared to `BuybackCore`: `cc_authority`. Collector
 /// Crypt signs a quote, not this transaction, so it needs no account here and

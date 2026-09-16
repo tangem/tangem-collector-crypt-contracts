@@ -99,7 +99,7 @@ done <<< "$PROGRAMS"
 echo
 if [ -z "$STACK_LOG" ]; then
   echo "FAIL     SBF stack check not run — no build log supplied."
-  echo "         anchor build 2>&1 | tee build.log && STACK_LOG=build.log $0"
+  echo "         bash scripts/build-sbf.sh && STACK_LOG=build.log $0"
   drift=1
 elif [ ! -f "$STACK_LOG" ]; then
   echo "FAIL     SBF stack check not run — '$STACK_LOG' does not exist."
@@ -114,13 +114,22 @@ else
   echo "OK       no SBF stack-offset warning in $STACK_LOG"
 fi
 
-# cc_buyback.so is NOT a mainnet fixture — it is not deployed anywhere, so there
-# is nothing to diff it against. It is hand-copied from
-# gachamachine/solana/target/deploy, and a stale copy is the quiet failure mode:
-# the suite goes green against the PREVIOUS ABI. Pin its hash so an accidental or
-# forgotten swap is visible, and so the pin has to be updated deliberately when
-# CC ships a new build.
+# cc_buyback.so is now a LIVE fixture: CC deployed it to devnet at
+# CcBuyM7sDhedBGLZxivBvgZVdqzrQAG66KYHgnTTEpLF, so it can be diffed against a
+# chain like the Metaplex ones. Two checks, because they catch opposite failures:
+#
+#   - the sha256 pin catches an accidental or forgotten local swap. A stale copy
+#     is the quiet failure mode: the suite goes green against the PREVIOUS ABI.
+#   - the devnet diff catches the pin and the fixture agreeing with each other
+#     while CC has moved on. That happened between 2026-09-14 and 2026-09-16 —
+#     the committed binary predated MARKER_CLOSE_DELAY and nothing here could
+#     see it.
+#
+# A dumped program is zero-padded to its allocated length, so compare only the
+# fixture's own byte count. Those bytes include the .so's own trailing zeros, so
+# this is an exact comparison and not a prefix match.
 echo
+CC_PROGRAM=CcBuyM7sDhedBGLZxivBvgZVdqzrQAG66KYHgnTTEpLF
 CC_SO=tests/fixtures/cc_buyback.so
 CC_PIN=tests/fixtures/cc_buyback.so.sha256
 if [ ! -f "$CC_SO" ]; then
@@ -140,6 +149,22 @@ else
     drift=1
   else
     echo "OK       cc_buyback.so matches its pin (${have:0:16}...)"
+  fi
+
+  if solana program dump -u d "$CC_PROGRAM" "$TMP/cc_buyback_devnet.so" >/dev/null 2>&1; then
+    live=$(head -c "$(wc -c < "$CC_SO")" "$TMP/cc_buyback_devnet.so" | shasum -a 256 | awk '{print $1}')
+    if [ "$live" = "$have" ]; then
+      echo "OK       cc_buyback.so is the program live on devnet"
+    else
+      drift=1
+      echo "DRIFT    cc_buyback.so is not what devnet runs."
+      echo "           fixture: $have"
+      echo "           devnet:  $live"
+      echo "           Ask CC for the matching build from"
+      echo "           gachamachine/solana/target/deploy, and update the pin with it."
+    fi
+  else
+    echo "UNCHECKED cc_buyback.so — could not dump $CC_PROGRAM from devnet"
   fi
 fi
 

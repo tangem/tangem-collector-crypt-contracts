@@ -52,6 +52,22 @@ against a whitelist and co-signs with the hot key — the Tangem-side role);
 `vault_cosign_demo.js` rehearses the full two-party protocol on devnet with
 the two roles held by separate keys.
 
+## cc_buyback v2 — what to read first
+
+Buybacks are now authorized by a CC-signed quote verified on chain by CC's own
+program, `CcBuyM7sDhedBGLZxivBvgZVdqzrQAG66KYHgnTTEpLF`. Two documents cover it:
+
+- **`docs/cc_buyback-SPEC.md`** — the wire contract: quote digest preimage,
+  `authorize_and_pay`'s account list and argument order, the order the checks run
+  in, and the trust boundary. A vendored copy of CC's authoritative file,
+  describing the exact binary in `tests/fixtures/cc_buyback.so`.
+- **`docs/CC-DEVNET.md`** — the devnet wiring sheet: CC's live addresses, the
+  `initialize_config` values that must match CC's policy, the per-standard client
+  contract (which handler, legacy vs v0, compute limit, rent leg), the quote
+  endpoint's response fields, and the error codes with their causes.
+
+The sections below describe the pre-v2 protocol and are kept for history.
+
 ## Verified integration facts (July 2026)
 
 Everything below was verified against Collector Crypt's live API, docs
@@ -485,12 +501,21 @@ Requires Rust + Solana CLI (Agave) 2.x + Anchor 0.31.1.
 # declare_id! + Anchor.toml away from 29agFEru… .
 mkdir -p target/deploy && cp keys/tangem_gacha_vault-keypair.json target/deploy/
 anchor keys list          # must print 29agFEruMu2jedVwnDgKPuq7ejmTiB7sEqzdhufQQS9u
-anchor build              # → target/deploy/tangem_gacha_vault.so + IDL
+bash scripts/build-sbf.sh # → target/deploy/tangem_gacha_vault.so
                           # NB: rewrites the .so that must stay byte-identical
                           # to devnet — re-verify the dump before redeploying.
 yarn install
 anchor test               # TS suite; needs a working solana-test-validator
 ```
+
+**Build through `scripts/build-sbf.sh`, not bare `anchor build`.** It pins
+platform-tools to **v1.52**. The default in solana-cli 4.2.x is v1.54, which
+compiles this program into a `.so` that faults at runtime after 411 compute
+units — `Access violation in unknown section at address 0x32 of size 1`, raised
+before any handler body runs, so no program log names the cause. What you see is
+all eight `caps.rs` tests failing in `init_vault` with `ProgramFailedToComplete`
+while the build itself exits 0. Override deliberately with `TOOLS_VERSION=vX.YZ`
+if you are testing a bump; `anchor build` is still how you regenerate the IDL.
 
 **Compile status (verified):** `cargo check`, `cargo build-sbf`, and
 `anchor build` all pass against anchor-lang 0.31.1 / anchor-spl 0.31.1 /
