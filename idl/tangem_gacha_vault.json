@@ -65,26 +65,22 @@
     "only; `revoke_buyback` and `update_vault` (rotate key) are the",
     "reactive controls.",
     "(c) co-sign `buyback_pnft` / `buyback_core` (see below).",
-    "- Tangem admin key: config only, but `config.gacha_wallet` is NOT merely a",
-    "payment address — it is an ASSET-CUSTODY authority. It is the `address =`",
-    "pin on `cc_authority`, i.e. it names the only key that may execute a",
-    "buyback — one that sends the prize to an UNCONSTRAINED `destination_owner`",
-    "of that signer's choosing, for pNFTs and for Core alike. So admin + hot",
-    "together can move ANY prize out of ANY vault, to any address, at any",
-    "`price > 0`, with no cold-key tap: `price` has no on-chain floor, the caps",
-    "do not apply, and the one-live-delegate slot does not either. In",
-    "particular Core prizes are no longer cold-only — before these",
-    "instructions, `withdraw_core` was their sole exit. Hold the admin key in a",
-    "multisig (Squads) — that is a prerequisite, not a nicety — and alarm on",
-    "`ConfigUpdated`, treating a change to ANY of `gacha_wallet`,",
-    "`gacha_usdc_account` or `fee_usdc_account` as break-glass. Incident levers,",
-    "in order of bluntness: repoint `gacha_wallet` (disables both buybacks",
-    "globally and moves the sweep rent away, while spins keep working, since",
-    "`open_pack` pins the separate `gacha_usdc_account`); `paused` (stops spins",
-    "and buybacks for everyone); per vault, a cold-key `update_vault` hot",
-    "rotation. `allow_buyback_delegation` gates `approve_buyback` ONLY and is",
-    "not a brake on the atomic buybacks.",
-    "The admin key also reaches value on a SECOND, independent path: the same",
+    "- Tangem admin key: config only. `config.rent_destination` (formerly",
+    "`gacha_wallet`) is now just that — where CC's fronted prize-ATA rent goes",
+    "back. It is NOT an asset-custody authority: buybacks are authorized by a",
+    "CC-signed quote verified against the cc_buyback policy, so no key held by",
+    "Tangem, and no key held by CC either, can move a prize on its own",
+    "signature. `price` is bound to the quote, `destination_owner` must be on",
+    "CC's on-chain allow-list, and each quote is spendable once against",
+    "cc_buyback's own `[b\"quote\", digest]` marker. Hold the admin key in a",
+    "multisig (Squads) — still a prerequisite — and alarm on `ConfigUpdated`,",
+    "treating a change to `gacha_usdc_account` or `fee_usdc_account` as",
+    "break-glass. Incident levers, in order of bluntness: CC's own `set_paused`",
+    "on the buyback policy (stops buybacks globally while spins keep working);",
+    "`paused` here (stops spins and buybacks for everyone); per vault, a",
+    "cold-key `update_vault` hot rotation. `allow_buyback_delegation` gates",
+    "`approve_buyback` ONLY and is not a brake on the atomic buybacks.",
+    "The admin key still reaches value on a SECOND, independent path: the same",
     "one-signature `update_config` rewrites `gacha_usdc_account` and",
     "`fee_usdc_account`, and those two pins are the only destination checks",
     "`open_pack` performs. One admin write therefore diverts 100% of every",
@@ -98,6 +94,55 @@
     "theft, not against CC."
   ],
   "instructions": [
+    {
+      "name": "accept_admin",
+      "docs": [
+        "Second half of the admin handover: the nominee claims the role. Until",
+        "this lands the sitting admin is unchanged, so a nomination sent to a",
+        "mistyped or unusable address costs nothing and is cancelled by",
+        "nominating the default pubkey."
+      ],
+      "discriminator": [
+        112,
+        42,
+        45,
+        90,
+        116,
+        181,
+        13,
+        170
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pending_admin",
+          "docs": [
+            "The nominee. Must sign, which is what proves the nominated address is",
+            "controllable — the failure mode a one-step handover cannot catch."
+          ],
+          "signer": true
+        }
+      ],
+      "args": []
+    },
     {
       "name": "approve_buyback",
       "docs": [
@@ -442,6 +487,298 @@
       ]
     },
     {
+      "name": "buyback_core_v2",
+      "docs": [
+        "Buyback of a Metaplex Core prize, authorized by a CC-signed quote",
+        "instead of a CC signature on the transaction.",
+        "",
+        "What changes versus `buyback_core`: Collector Crypt no longer signs",
+        "anything here. The transaction carries a top-level ed25519 instruction",
+        "holding CC's detached quote; this program CPIs into `cc_buyback`, which",
+        "verifies that quote against its own policy and moves the payment. So",
+        "`config.rent_destination` stops being an asset-custody authority, `price`",
+        "is bound to the quote rather than merely `> 0`, `destination_owner` must",
+        "be on CC's destination allow-list, and cc_buyback's own quote marker",
+        "makes the quote",
+        "spendable exactly once.",
+        "",
+        "The phone still co-signs, so the user still approves the specific price,",
+        "and it is now also the fee payer and the mpl-core rent payer.",
+        "",
+        "CLIENT CONTRACT: prepend the ed25519 quote instruction CC returned, and",
+        "display the `price` ARGUMENT — not the quote the API rendered."
+      ],
+      "discriminator": [
+        119,
+        56,
+        255,
+        113,
+        36,
+        14,
+        78,
+        136
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault.cold_owner",
+                "account": "Vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "hot_delegate",
+          "docs": [
+            "User consent to the offered price. Also fee payer and mpl-core rent payer."
+          ],
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "destination_owner",
+          "docs": [
+            "it against CC's on-chain allow-list, and the same value is bound into the",
+            "signed quote — two independent checks, neither of them this program's."
+          ]
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "cc_usdc",
+          "docs": [
+            "CC's treasury token account. Its authority is cc_buyback's policy PDA,",
+            "acting as an spl-token delegate; the account's OWNER stays CC's wallet,",
+            "which is what keeps CC's webhook reconciliation matching."
+          ],
+          "writable": true
+        },
+        {
+          "name": "vault_usdc",
+          "docs": [
+            "The vault's canonical USDC ATA — the only place the payment can land."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "usdc_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "asset",
+          "writable": true
+        },
+        {
+          "name": "collection"
+        },
+        {
+          "name": "mpl_core_program",
+          "address": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
+        },
+        {
+          "name": "cc_program"
+        },
+        {
+          "name": "cc_policy",
+          "docs": [
+            "`seeds = [b\"policy\"]` constraint pins which account it must be, so a",
+            "different cc_buyback-owned account is rejected there rather than passing",
+            "silently."
+          ]
+        },
+        {
+          "name": "cc_quote_marker",
+          "docs": [
+            "digest is recomputed inside cc_buyback — so cc_buyback verifies the",
+            "address. Empty on the way in; cc_buyback allocates it."
+          ],
+          "writable": true
+        },
+        {
+          "name": "cc_rent_vault",
+          "docs": [
+            "the phone does not pay for CC's bookkeeping."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  110,
+                  116
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                172,
+                116,
+                57,
+                102,
+                74,
+                1,
+                55,
+                84,
+                59,
+                72,
+                121,
+                138,
+                216,
+                27,
+                159,
+                167,
+                166,
+                110,
+                218,
+                34,
+                87,
+                204,
+                74,
+                225,
+                244,
+                252,
+                45,
+                56,
+                3,
+                167,
+                112,
+                160
+              ]
+            }
+          }
+        },
+        {
+          "name": "cc_memo_program",
+          "docs": [
+            "account list, so this is an append — no earlier meta shifts."
+          ],
+          "address": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+        },
+        {
+          "name": "sysvar_instructions",
+          "docs": [
+            "quote instruction through it."
+          ],
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "price",
+          "type": "u64"
+        },
+        {
+          "name": "quote_id",
+          "type": "u64"
+        },
+        {
+          "name": "expires_at",
+          "type": "i64"
+        },
+        {
+          "name": "memo",
+          "type": "string"
+        }
+      ]
+    },
+    {
       "name": "buyback_pnft",
       "docs": [
         "Atomic buyback of a prize pNFT, executed by Collector Crypt against",
@@ -706,6 +1043,325 @@
         {
           "name": "price",
           "type": "u64"
+        },
+        {
+          "name": "memo",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "buyback_pnft_v2",
+      "docs": [
+        "Buyback of a prize pNFT, authorized by a CC-signed quote.",
+        "",
+        "Same change as `buyback_core_v2`: Collector Crypt signs a detached quote",
+        "rather than this transaction, so `price` is bound to that signature,",
+        "`destination_owner` must be on CC's on-chain allow-list, and",
+        "cc_buyback's own quote marker makes it spendable once. The phone is the",
+        "only signer, and pays the fee and the Metaplex rent.",
+        "",
+        "CLIENT CONTRACT — this instruction carries 24 accounts and does NOT fit",
+        "a legacy transaction. Build a v0 transaction against CC's frozen address",
+        "lookup table, prepend the ed25519 quote instruction, request ~500k",
+        "compute units, and create the vault's USDC ATA idempotently if it may",
+        "not exist. Display the `price` ARGUMENT, not the quote the API rendered."
+      ],
+      "discriminator": [
+        183,
+        236,
+        163,
+        79,
+        114,
+        9,
+        88,
+        177
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault.cold_owner",
+                "account": "Vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "hot_delegate",
+          "docs": [
+            "User consent to the offered price. Also fee payer, TransferV1 payer and",
+            "destination-ATA rent payer."
+          ],
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "cc_authority",
+          "writable": true
+        },
+        {
+          "name": "destination_owner",
+          "docs": [
+            "into the signed quote."
+          ]
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "cc_usdc",
+          "docs": [
+            "CC's treasury token account; cc_buyback pulls from it as spl-token",
+            "delegate, leaving its owner unchanged."
+          ],
+          "writable": true
+        },
+        {
+          "name": "vault_usdc",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "usdc_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "nft_mint"
+        },
+        {
+          "name": "nft_token",
+          "writable": true
+        },
+        {
+          "name": "destination_token",
+          "writable": true
+        },
+        {
+          "name": "metadata",
+          "writable": true
+        },
+        {
+          "name": "edition"
+        },
+        {
+          "name": "token_record",
+          "writable": true
+        },
+        {
+          "name": "destination_token_record",
+          "writable": true
+        },
+        {
+          "name": "authorization_rules",
+          "optional": true
+        },
+        {
+          "name": "authorization_rules_program",
+          "docs": [
+            "passing THIS PROGRAM's id; the slot is not last, so it must be filled."
+          ],
+          "optional": true
+        },
+        {
+          "name": "token_metadata_program",
+          "address": "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+        },
+        {
+          "name": "sysvar_instructions",
+          "docs": [
+            "cc_buyback reads."
+          ],
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "ata_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "cc_program"
+        },
+        {
+          "name": "cc_policy",
+          "docs": [
+            "account it must be."
+          ]
+        },
+        {
+          "name": "cc_quote_marker",
+          "docs": [
+            "digest is recomputed inside cc_buyback — so cc_buyback verifies the",
+            "address. Empty on the way in; cc_buyback allocates it."
+          ],
+          "writable": true
+        },
+        {
+          "name": "cc_rent_vault",
+          "docs": [
+            "the phone does not pay for CC's bookkeeping."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  110,
+                  116
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                172,
+                116,
+                57,
+                102,
+                74,
+                1,
+                55,
+                84,
+                59,
+                72,
+                121,
+                138,
+                216,
+                27,
+                159,
+                167,
+                166,
+                110,
+                218,
+                34,
+                87,
+                204,
+                74,
+                225,
+                244,
+                252,
+                45,
+                56,
+                3,
+                167,
+                112,
+                160
+              ]
+            }
+          }
+        },
+        {
+          "name": "cc_memo_program",
+          "docs": [
+            "account list, so this is an append — no earlier meta shifts."
+          ],
+          "address": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "price",
+          "type": "u64"
+        },
+        {
+          "name": "quote_id",
+          "type": "u64"
+        },
+        {
+          "name": "expires_at",
+          "type": "i64"
         },
         {
           "name": "memo",
@@ -1043,7 +1699,7 @@
       ],
       "args": [
         {
-          "name": "gacha_wallet",
+          "name": "rent_destination",
           "type": "pubkey"
         },
         {
@@ -1455,7 +2111,11 @@
     {
       "name": "update_config",
       "docs": [
-        "Admin-only partial updates of the global config."
+        "Admin-only partial updates of the global config.",
+        "",
+        "`pending_admin` NOMINATES a successor; it does not hand over. The",
+        "nominee must call `accept_admin`. Passing the default pubkey cancels a",
+        "pending nomination."
       ],
       "discriminator": [
         29,
@@ -1497,13 +2157,13 @@
       ],
       "args": [
         {
-          "name": "new_admin",
+          "name": "pending_admin",
           "type": {
             "option": "pubkey"
           }
         },
         {
-          "name": "gacha_wallet",
+          "name": "rent_destination",
           "type": {
             "option": "pubkey"
           }
@@ -1993,6 +2653,19 @@
   ],
   "events": [
     {
+      "name": "AdminTransferred",
+      "discriminator": [
+        255,
+        147,
+        182,
+        5,
+        199,
+        217,
+        38,
+        179
+      ]
+    },
+    {
       "name": "BuybackApproved",
       "discriminator": [
         218,
@@ -2272,9 +2945,40 @@
       "code": 6021,
       "name": "UnsupportedMint",
       "msg": "USDC mint must be a legacy SPL Token mint"
+    },
+    {
+      "code": 6022,
+      "name": "StaleQuoteNonce",
+      "msg": "Quote nonce does not match the vault's current buyback nonce"
+    },
+    {
+      "code": 6023,
+      "name": "CcProgramMismatch",
+      "msg": "cc_program is not the Collector Crypt buyback program"
+    },
+    {
+      "code": 6024,
+      "name": "CcPolicyMismatch",
+      "msg": "cc_policy is not owned by the Collector Crypt buyback program"
     }
   ],
   "types": [
+    {
+      "name": "AdminTransferred",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "previous",
+            "type": "pubkey"
+          },
+          {
+            "name": "current",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
     {
       "name": "BuybackApproved",
       "type": {
@@ -2341,20 +3045,32 @@
             "type": "pubkey"
           },
           {
+            "name": "pending_admin",
+            "docs": [
+              "Nominated admin, or the default pubkey when no handover is pending.",
+              "Handover is two-step so a mistyped address cannot brick governance:",
+              "the sitting admin keeps its powers until the nominee calls",
+              "`accept_admin`."
+            ],
+            "type": "pubkey"
+          },
+          {
             "name": "usdc_mint",
             "type": "pubkey"
           },
           {
-            "name": "gacha_wallet",
+            "name": "rent_destination",
             "docs": [
-              "CC's operator wallet. LOAD-BEARING FOR CUSTODY, not just for routing:",
-              "it is the rent destination of `sweep_prize_ata` AND the `address =` pin",
-              "on `cc_authority`, i.e. the only key that may execute a buyback — one",
-              "that sends the prize to an unconstrained `destination_owner` of the",
-              "signer's choosing. Admin-writable in one step, so admin +",
-              "a vault's hot key can move that vault's prizes out at any price > 0.",
-              "Repointing it is also the surgical way to disable both buybacks",
-              "globally without stopping spins."
+              "Where CC's fronted prize-ATA rent goes back: the `sweep_prize_ata`",
+              "destination, and the account that receives the closed prize ATA's",
+              "lamports during a buyback.",
+              "",
+              "It is NOT a custody authority. Buybacks are authorized by a CC-signed",
+              "quote verified against the cc_buyback policy, not by a signature from",
+              "this key, so repointing it moves where rent lands and nothing else.",
+              "The old name `gacha_wallet` described a field that was simultaneously a",
+              "payment address and the only key able to move a user's prize; that",
+              "second role is gone."
             ],
             "type": "pubkey"
           },
@@ -2413,6 +3129,22 @@
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "_padding",
+            "docs": [
+              "Growth room. Config was previously allocated at exactly",
+              "`8 + INIT_SPACE`, and with no realloc, no migration instruction, an",
+              "`init`-only constructor at fixed seeds and no close, that made every",
+              "future field impossible. Reserved before the first mainnet Config",
+              "exists, because after that it cannot be."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                128
+              ]
+            }
           }
         ]
       }
@@ -2427,7 +3159,11 @@
             "type": "pubkey"
           },
           {
-            "name": "gacha_wallet",
+            "name": "pending_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "rent_destination",
             "type": "pubkey"
           },
           {
@@ -2529,7 +3265,7 @@
           {
             "name": "rent_refund",
             "docs": [
-              "Lamports forwarded to `config.gacha_wallet` — exactly the closed",
+              "Lamports forwarded to `config.rent_destination` — exactly the closed",
               "account's rent-exempt minimum. Anything the account held above it stays",
               "in the vault."
             ],
@@ -2639,10 +3375,24 @@
             "type": "i64"
           },
           {
-            "name": "_reserved",
+            "name": "buyback_nonce",
             "docs": [
-              "Layout padding left by a removed legacy field; kept so already-deployed",
-              "vaults stay layout-compatible. Always 0."
+              "Monotonic counter binding each buyback quote to one spend. CC signs the",
+              "value it read here; `buyback_*_v2` requires the quote to carry the",
+              "current value and increments it, so a quote is spendable exactly once.",
+              "",
+              "This is why no per-quote marker account is needed. \"The asset left the",
+              "vault\" is not a sufficient guard on its own: CC's webhook re-pools a",
+              "card the moment a buyback confirms, so a player can win the same card",
+              "back inside the quote TTL and the original quote would replay at a",
+              "stale price — and `buyback_core` closes nothing, so it leaves no",
+              "residue at all. At 10k buybacks/day a marker account would cost roughly",
+              "$700k–$1.1M a year in rent; a counter costs nothing and, being",
+              "per-vault, takes no shared write lock.",
+              "",
+              "Occupies the bytes of the former `_reserved: u64`, which was dead",
+              "padding always written 0 — so the layout is unchanged and every",
+              "existing vault already reads as nonce 0."
             ],
             "type": "u64"
           },
@@ -2676,6 +3426,20 @@
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "_padding",
+            "docs": [
+              "Growth room, for the same reason as `Config::_padding`. A Vault is",
+              "per-user, so adding a field later would mean a cold-card tap per user",
+              "even if a migration instruction existed."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                128
+              ]
+            }
           }
         ]
       }

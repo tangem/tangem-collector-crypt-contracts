@@ -88,26 +88,84 @@ while read -r id file; do
 done <<< "$PROGRAMS"
 
 # --- SBF stack guard -------------------------------------------------------
-# BuybackPnft's generated try_accounts sits ~8 bytes under the 4 KB SBF stack
-# frame limit, so one more `#[account(address = ...)]` in that context pushes it
-# over. The toolchain only WARNS and still emits the .so, which is why lib.rs
-# pins the auth-rules program in the handler instead. This is the check that
-# comment refers to: fail the build log rather than ship a silently-overflowing
-# binary.
+# A generated try_accounts frame that exceeds the 4 KB SBF limit is only a
+# WARNING: cargo/anchor exit 0 and still write the .so. In that artifact the
+# spilled bytes corrupt deserialization — OpenPack overflowing by 8 bytes made
+# `config.paused` read true from a zero byte, killing every spin with error
+# 6000. So the log must be checked, and NOT checking it must fail too.
+#
+# This used to default to SKIPPED and then print "Safe to deploy" with exit 0,
+# which is the same outcome as passing for anyone reading the exit code.
 echo
-if [ -f "$STACK_LOG" ]; then
-  if grep -q "Stack offset" "$STACK_LOG"; then
-    echo "STACK OVERFLOW in $STACK_LOG:"
-    grep -n "Stack offset" "$STACK_LOG" | head -5
-    echo "  ^ a generated try_accounts frame exceeded the 4 KB SBF limit."
-    echo "    cargo/anchor exit 0 on this and still write the .so — do not deploy."
+if [ -z "$STACK_LOG" ]; then
+  echo "FAIL     SBF stack check not run — no build log supplied."
+  echo "         bash scripts/build-sbf.sh && STACK_LOG=build.log $0"
+  drift=1
+elif [ ! -f "$STACK_LOG" ]; then
+  echo "FAIL     SBF stack check not run — '$STACK_LOG' does not exist."
+  drift=1
+elif grep -q "Stack offset" "$STACK_LOG"; then
+  echo "STACK OVERFLOW in $STACK_LOG:"
+  grep -n "Stack offset" "$STACK_LOG" | head -5
+  echo "  ^ a generated try_accounts frame exceeded the 4 KB SBF limit."
+  echo "    cargo/anchor exit 0 on this and still write the .so — do not deploy."
+  drift=1
+else
+  echo "OK       no SBF stack-offset warning in $STACK_LOG"
+fi
+
+# cc_buyback.so is now a LIVE fixture: CC deployed it to devnet at
+# CcBuyM7sDhedBGLZxivBvgZVdqzrQAG66KYHgnTTEpLF, so it can be diffed against a
+# chain like the Metaplex ones. Two checks, because they catch opposite failures:
+#
+#   - the sha256 pin catches an accidental or forgotten local swap. A stale copy
+#     is the quiet failure mode: the suite goes green against the PREVIOUS ABI.
+#   - the devnet diff catches the pin and the fixture agreeing with each other
+#     while CC has moved on. That happened between 2026-09-14 and 2026-09-16 —
+#     the committed binary predated MARKER_CLOSE_DELAY and nothing here could
+#     see it.
+#
+# A dumped program is zero-padded to its allocated length, so compare only the
+# fixture's own byte count. Those bytes include the .so's own trailing zeros, so
+# this is an exact comparison and not a prefix match.
+echo
+CC_PROGRAM=CcBuyM7sDhedBGLZxivBvgZVdqzrQAG66KYHgnTTEpLF
+CC_SO=tests/fixtures/cc_buyback.so
+CC_PIN=tests/fixtures/cc_buyback.so.sha256
+if [ ! -f "$CC_SO" ]; then
+  echo "FAIL     $CC_SO missing — copy it from gachamachine/solana/target/deploy."
+  drift=1
+elif [ ! -f "$CC_PIN" ]; then
+  echo "FAIL     $CC_PIN missing — record it with: shasum -a 256 $CC_SO | awk '{print \$1}' > $CC_PIN"
+  drift=1
+else
+  have=$(shasum -a 256 "$CC_SO" | awk '{print $1}')
+  want=$(tr -d '[:space:]' < "$CC_PIN")
+  if [ "$have" != "$want" ]; then
+    echo "FAIL     cc_buyback.so does not match its pin."
+    echo "         pinned $want"
+    echo "         actual $have"
+    echo "         If CC shipped a new build, update the pin in the same commit."
     drift=1
   else
-    echo "OK       no SBF stack-offset warning in $STACK_LOG"
+    echo "OK       cc_buyback.so matches its pin (${have:0:16}...)"
   fi
-else
-  echo "SKIPPED  SBF stack check — pass a build log: STACK_LOG=build.log $0"
-  echo "         (anchor build 2>&1 | tee build.log)"
+
+  if solana program dump -u d "$CC_PROGRAM" "$TMP/cc_buyback_devnet.so" >/dev/null 2>&1; then
+    live=$(head -c "$(wc -c < "$CC_SO")" "$TMP/cc_buyback_devnet.so" | shasum -a 256 | awk '{print $1}')
+    if [ "$live" = "$have" ]; then
+      echo "OK       cc_buyback.so is the program live on devnet"
+    else
+      drift=1
+      echo "DRIFT    cc_buyback.so is not what devnet runs."
+      echo "           fixture: $have"
+      echo "           devnet:  $live"
+      echo "           Ask CC for the matching build from"
+      echo "           gachamachine/solana/target/deploy, and update the pin with it."
+    fi
+  else
+    echo "UNCHECKED cc_buyback.so — could not dump $CC_PROGRAM from devnet"
+  fi
 fi
 
 echo
@@ -115,4 +173,4 @@ if [ "$drift" -ne 0 ]; then
   echo "FIXTURE DRIFT — do not deploy until reviewed (see above)."
   exit 1
 fi
-echo "All $checked fixtures match mainnet-beta. Safe to deploy."
+echo "All $checked fixtures match mainnet-beta, SBF stack clean. Safe to deploy."
