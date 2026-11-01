@@ -91,7 +91,7 @@ describe("tangem-gacha-vault", () => {
 
   before(async () => {
     await Promise.all(
-      [owner, coldOwner2, sessionKey, gachaWallet, attacker].map(
+      [attacker].map(
         async (kp) => {
           const sig = await connection.requestAirdrop(
             kp.publicKey,
@@ -149,18 +149,53 @@ describe("tangem-gacha-vault", () => {
     vault2Usdc = getAssociatedTokenAddressSync(usdcMint, vault2Pda, true);
   });
 
+  it("publishes exactly the Day 1 ABI and preserves the seven user instructions", () => {
+    assert.equal(program.programId.toBase58(), "FKWs2cd5E9Fi8t2Gqbq6SkgekL4MJwZgkRMrGFcPGVvt");
+    const instructions = (program.idl as any).instructions;
+    const names = instructions.map((i: any) => snake(i.name)).sort();
+    assert.deepEqual(names, [
+      "initialize_config", "update_config", "init_vault", "update_vault",
+      "purchase_pack", "withdraw_token", "withdraw_sol", "close_token_account", "close_vault",
+    ].sort());
+    const userAbi: Record<string, { accounts: string[]; args: string[] }> = {
+      init_vault: { accounts: ["vault", "owner", "payer", "system_program"], args: ["session_key", "per_spin_cap", "daily_cap"] },
+      update_vault: { accounts: ["vault", "owner"], args: ["session_key", "per_spin_cap", "daily_cap"] },
+      purchase_pack: { accounts: ["config", "vault", "session_key", "usdc_mint", "vault_usdc", "gacha_usdc", "fee_usdc", "token_program"], args: ["amount", "fee_amount", "memo"] },
+      withdraw_token: { accounts: ["vault", "owner", "source", "mint", "destination", "token_program"], args: ["amount"] },
+      withdraw_sol: { accounts: ["vault", "owner", "recipient"], args: ["lamports"] },
+      close_token_account: { accounts: ["vault", "owner", "token", "token_program"], args: [] },
+      close_vault: { accounts: ["vault", "owner"], args: [] },
+    };
+    for (const [name, expected] of Object.entries(userAbi)) {
+      const ix = instructions.find((i: any) => snake(i.name) === name);
+      assert.deepEqual(ix.accounts.map((a: any) => snake(a.name)), expected.accounts, `${name} accounts`);
+      assert.deepEqual(ix.args.map((a: any) => snake(a.name)), expected.args, `${name} args`);
+    }
+    assert.deepEqual(idlStructFields("Config"), [
+      "admin", "usdc_mint", "gacha_usdc_account", "fee_usdc_account", "min_fee_bps", "max_fee_bps", "paused", "bump", "reserved",
+    ]);
+    assert.deepEqual(idlStructFields("Vault"), [
+      "owner", "session_key", "per_spin_cap", "daily_cap", "spent_today", "day_index", "bump", "reserved",
+    ]);
+    assert.deepEqual(idlStructFields("PackOpened"), ["vault", "owner", "amount", "fee", "memo"]);
+    assert.deepEqual((program.idl as any).errors.map((e: any) => [e.code, e.name[0].toUpperCase() + e.name.slice(1)]), [
+      [6000, "Paused"], [6001, "ZeroAmount"], [6002, "InvalidMemo"], [6003, "InvalidFeeBps"],
+      [6004, "InvalidCaps"], [6005, "ExceedsPerSpinCap"], [6006, "ExceedsDailyCap"], [6007, "MathOverflow"],
+      [6015, "TokenAccountNotEmpty"], [6016, "DelegateStillSet"], [6017, "InsufficientSol"],
+      [6018, "Unauthorized"], [6021, "UnsupportedMint"], [6022, "FeeBelowMinimum"], [6023, "FeeAboveMaximum"],
+    ]);
+  });
+
   it("initialize_config: rejects an admin that is not the upgrade authority", async () => {
     // Front-running protection: only the program's upgrade authority may
     // initialize the config (program_data.upgrade_authority_address == admin).
     try {
       await program.methods
         .initializeConfig(
-          gachaWallet.publicKey,
           gachaUsdc,
           feeUsdc,
           FEE_BPS,
-          MAX_FEE_BPS_CFG,
-          true
+          MAX_FEE_BPS_CFG
         )
         .accountsPartial({
           config: configPda,
@@ -183,12 +218,10 @@ describe("tangem-gacha-vault", () => {
   it("initializes config (upgrade authority only)", async () => {
     await program.methods
       .initializeConfig(
-        gachaWallet.publicKey,
         gachaUsdc,
         feeUsdc,
         FEE_BPS,
-        MAX_FEE_BPS_CFG,
-        true // buyback delegation on
+        MAX_FEE_BPS_CFG
       )
       .accountsPartial({
         config: configPda,
@@ -204,25 +237,28 @@ describe("tangem-gacha-vault", () => {
     assert.ok(cfg.gachaUsdcAccount.equals(gachaUsdc));
     assert.equal(cfg.minFeeBps, FEE_BPS);
     assert.equal(cfg.maxFeeBps, MAX_FEE_BPS_CFG);
-    assert.isTrue(cfg.allowBuybackDelegation);
+    assert.isFalse(cfg.paused);
+    assert.lengthOf((await connection.getAccountInfo(configPda))!.data, 174);
   });
 
-  it("initializes a vault (cold signs, hot pays rent) and funds it", async () => {
+  it("initializes a vault with a separate fee/rent sponsor and funds it", async () => {
     await program.methods
       .initVault(sessionKey.publicKey, PER_SPIN_CAP, DAILY_CAP)
       .accountsPartial({
         vault: vaultPda,
         owner: owner.publicKey,
-        payer: sessionKey.publicKey,
+        payer: admin.publicKey,
         systemProgram: SystemProgram.programId,
       })
-      .signers([owner, sessionKey])
+      .signers([owner])
       .rpc();
 
     const vault = await program.account.vault.fetch(vaultPda);
     assert.ok(vault.owner.equals(owner.publicKey));
     assert.ok(vault.sessionKey.equals(sessionKey.publicKey));
-    assert.isNull(vault.liveBuybackMint);
+    assert.lengthOf((await connection.getAccountInfo(vaultPda))!.data, 137);
+    assert.equal(await connection.getBalance(owner.publicKey), 0);
+    assert.equal(await connection.getBalance(sessionKey.publicKey), 0);
 
     // Deposit: in production a plain SPL transfer signed by the cold key
     // (one tap). Here we just mint directly to the vault ATA.
@@ -380,7 +416,7 @@ describe("tangem-gacha-vault", () => {
         tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([sessionKey])
-      .rpc({ commitment: "confirmed" });
+      .rpc({ commitment: "confirmed", preflightCommitment: "confirmed" });
 
     const gachaAfter = (await getAccount(connection, gachaUsdc)).amount;
     const feeAfter = (await getAccount(connection, feeUsdc)).amount;
@@ -431,10 +467,10 @@ describe("tangem-gacha-vault", () => {
       .accountsPartial({
         vault: vault2Pda,
         owner: coldOwner2.publicKey,
-        payer: sessionKey.publicKey,
+        payer: admin.publicKey,
         systemProgram: SystemProgram.programId,
       })
-      .signers([coldOwner2, sessionKey])
+      .signers([coldOwner2])
       .rpc();
     await createAssociatedTokenAccount(
       connection,
@@ -479,7 +515,7 @@ describe("tangem-gacha-vault", () => {
       .updateVault(sessionKey2.publicKey, null, null)
       .accountsPartial({ vault: vault2Pda, owner: coldOwner2.publicKey })
       .signers([coldOwner2])
-      .rpc({ commitment: "confirmed" });
+      .rpc({ commitment: "confirmed", preflightCommitment: "confirmed" });
 
     const vault = await program.account.vault.fetch(vault2Pda);
     assert.ok(vault.sessionKey.equals(sessionKey2.publicKey));
@@ -504,7 +540,7 @@ describe("tangem-gacha-vault", () => {
       .updateVault(null, null, usd(200))
       .accountsPartial({ vault: vault2Pda, owner: coldOwner2.publicKey })
       .signers([coldOwner2])
-      .rpc({ commitment: "confirmed" });
+      .rpc({ commitment: "confirmed", preflightCommitment: "confirmed" });
     assert.isUndefined(
       (await eventsOf(sig2)).find((e) => e.name === "sessionKeyRotated")
     );
@@ -524,18 +560,23 @@ describe("tangem-gacha-vault", () => {
     }
   });
 
-  // approve_buyback / revoke_buyback / clear_buyback_slot / withdraw_pnft
-  // operate on Metaplex programmable NFTs (frozen token accounts) and need
-  // the real Token Metadata + auth-rules programs — they are covered by the
-  // litesvm suite (programs/tangem-gacha-vault/tests/pnft.rs) against
-  // mainnet-dumped fixtures; withdraw_core likewise in
-  // programs/tangem-gacha-vault/tests/core.rs. This
-  // hermetic TS suite covers the SPL-level logic (auth, caps, config).
-
   it("close_vault: closes a clean vault, rent returns to the cold owner", async () => {
-    // The VaultNotClean gate (live pNFT buyback delegate) is exercised in the
-    // litesvm suite (pnft.rs close_vault_rejected_while_buyback_slot_live);
-    // the hermetic TS suite covers the happy path on the idle second vault.
+    // Recover the balance and close its ATA before closing the vault itself.
+    const recipient = await createAssociatedTokenAccount(
+      connection, admin, usdcMint, coldOwner2.publicKey
+    );
+    const balance = (await getAccount(connection, vault2Usdc)).amount;
+    await program.methods
+      .withdrawToken(new anchor.BN(balance.toString()))
+      .accountsPartial({
+        vault: vault2Pda, owner: coldOwner2.publicKey, source: vault2Usdc,
+        mint: usdcMint, destination: recipient, tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([coldOwner2]).rpc();
+    await program.methods.closeTokenAccount()
+      .accountsPartial({ vault: vault2Pda, owner: coldOwner2.publicKey,
+        token: vault2Usdc, tokenProgram: TOKEN_PROGRAM_ID })
+      .signers([coldOwner2]).rpc();
     await program.methods
       .closeVault()
       .accountsPartial({ vault: vault2Pda, owner: coldOwner2.publicKey })
@@ -689,7 +730,7 @@ describe("tangem-gacha-vault", () => {
 
   it("pause blocks purchase_pack", async () => {
     await program.methods
-      .updateConfig(null, null, null, null, null, null, true, null)
+      .updateConfig(null, null, null, null, null, true)
       .accountsPartial({ config: configPda, admin: admin.publicKey })
       .rpc();
     try {
@@ -716,7 +757,7 @@ describe("tangem-gacha-vault", () => {
   it("update_config: non-admin is rejected", async () => {
     try {
       await program.methods
-        .updateConfig(null, null, null, null, null, null, false, null)
+        .updateConfig(null, null, null, null, null, false)
         .accountsPartial({ config: configPda, admin: attacker.publicKey })
         .signers([attacker])
         .rpc();
@@ -729,7 +770,7 @@ describe("tangem-gacha-vault", () => {
   it("update_config: fee above MAX_FEE_BPS is rejected", async () => {
     try {
       await program.methods
-        .updateConfig(null, null, null, null, null, 5000, null, null)
+        .updateConfig(null, null, null, null, 5000, null)
         .accountsPartial({ config: configPda, admin: admin.publicKey })
         .rpc();
       assert.fail("should have thrown");
@@ -742,7 +783,7 @@ describe("tangem-gacha-vault", () => {
     // min stays 100 (1%); max = 50 would invert the corridor.
     try {
       await program.methods
-        .updateConfig(null, null, null, null, null, FEE_BPS - 50, null, null)
+        .updateConfig(null, null, null, null, FEE_BPS - 50, null)
         .accountsPartial({ config: configPda, admin: admin.publicKey })
         .rpc();
       assert.fail("should have thrown");
@@ -752,7 +793,7 @@ describe("tangem-gacha-vault", () => {
     // Raising min above the current max in one call fails the same way.
     try {
       await program.methods
-        .updateConfig(null, null, null, null, MAX_FEE_BPS_CFG + 1, null, null, null)
+        .updateConfig(null, null, null, MAX_FEE_BPS_CFG + 1, null, null)
         .accountsPartial({ config: configPda, admin: admin.publicKey })
         .rpc();
       assert.fail("should have thrown");
