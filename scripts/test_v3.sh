@@ -28,10 +28,12 @@ cleanup() {
 }
 trap cleanup EXIT
 export ANCHOR_PROVIDER_URL="http://127.0.0.1:18999"
+# Fund the selected test payer, independently of the Solana CLI's default wallet.
 "$AGAVE_BIN/solana-test-validator" \
   --ledger "$run_dir/ledger" --bind-address 127.0.0.1 \
   --rpc-port 18999 --faucet-port 19900 \
   --gossip-port 20001 --dynamic-port-range 20000-20100 \
+  --mint "$authority" \
   --upgradeable-program "$program_id" "$artifact" "$authority" \
   > "$run_dir/validator.log" 2>&1 &
 validator_pid=$!

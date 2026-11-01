@@ -346,10 +346,8 @@ fn floor_fee(amount: u64, bps: u16) -> u64 {
 /// Raw state readers depend on this Day 1 schema, independently of Rust names.
 #[test]
 fn day1_account_layouts_are_pinned() {
-    assert_eq!(
-        PROGRAM_ID,
-        pubkey!("FKWs2cd5E9Fi8t2Gqbq6SkgekL4MJwZgkRMrGFcPGVvt")
-    );
+    // The schema is independent of the deployment identity. Runtime tests use
+    // the current declare_id!, so a binary built for another ID still fails.
     assert_eq!(8 + Config::INIT_SPACE, 174);
     assert_eq!(8 + Vault::INIT_SPACE, 137);
     assert_eq!(MAX_FEE_BPS, 1_000);

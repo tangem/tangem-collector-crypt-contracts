@@ -257,9 +257,31 @@ fixtures and NFT-specific dependencies are not part of the Day 1 build.
 The local/devnet program keypair is private and untracked:
 `keys/tangem_gacha_vault-day1-keypair.json`. For a maintainer's local run,
 copy that keypair to `target/deploy/tangem_gacha_vault-keypair.json` before
-Anchor creates another identity. An external clone can use its own local
-identity, updating `declare_id!` and `Anchor.toml` consistently; such an
-identity is not a deployed Tangem program. Mainnet uses a separate keypair.
+Anchor creates another identity. Mainnet uses a separate keypair.
+
+An external clone needs no maintainer key. To use its own local identity,
+generate a program keypair in the ignored build directory (do not overwrite
+an existing keypair):
+
+```bash
+mkdir -p target/deploy
+solana-keygen new --no-bip39-passphrase --silent \
+  --outfile target/deploy/tangem_gacha_vault-keypair.json
+solana-keygen pubkey target/deploy/tangem_gacha_vault-keypair.json
+```
+
+Use that public key in `declare_id!` in `programs/tangem-gacha-vault/src/lib.rs`,
+both `[programs.localnet]` and `[[test.genesis]].address` in `Anchor.toml`,
+and this README's current local/devnet address and compatibility-table entry.
+If the private `INTEGRATION.md` is present, update its current address too.
+Keep historical deployment addresses and verification hashes as historical
+records: changing the program id produces a different binary and new PDAs.
+The local identity is not a deployed Tangem program. Configure
+`[provider].wallet` in `Anchor.toml` to an available local-test payer keypair.
+
+Then run the build and checks below. The build regenerates the local IDL and
+TypeScript types; copying the generated IDL updates its published address.
+No test constants or archived ABI snapshots need changing for a new identity.
 
 ```bash
 yarn install
@@ -353,3 +375,25 @@ values. Record the deployed binary hash and slot after deployment, and run
 the owner-onboarding → sponsored purchase → owner-delivery → withdrawal
 flow against that deployment. Mainnet e2e does not replace the planned
 external audit and fixes before product launch.
+
+## Public repository mirror
+
+The mirror workflow prepares a separate bare repository containing only
+`main` and the explicitly allowed `custody-full` tag, when that tag is an
+ancestor of `main`. It rewrites commit authors/committers and annotated-tag
+taggers to the service identity and removes `.github` and `.gitignore` from
+the published history. Rewriting changes commit/tag ids and removes old tag
+signatures. Additional public tags require an explicit allowlist change.
+
+Publication uses explicit refspecs rather than `--mirror`. The same atomic
+push removes legacy `refs/original/*` and `refs/remotes/*` exported by the
+old workflow, while retaining other remote branches, tags and PR refs.
+This cleanup takes effect when the updated workflow runs; changing these
+scripts locally does not change the public repository or erase cached objects.
+
+The workflow first runs the local mirror regression tests. To run them
+without publishing or using GitHub credentials:
+
+```bash
+python3 -m unittest discover -s scripts/tests -v
+```

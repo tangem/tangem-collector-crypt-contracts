@@ -15,6 +15,7 @@ import {
   getAccount,
 } from "@solana/spl-token";
 import { assert } from "chai";
+import { readFileSync } from "fs";
 import { TangemGachaVault } from "../target/types/tangem_gacha_vault";
 
 const BPF_UPGRADEABLE_LOADER = new PublicKey(
@@ -150,7 +151,9 @@ describe("tangem-gacha-vault", () => {
   });
 
   it("publishes exactly the Day 1 ABI and preserves the seven user instructions", () => {
-    assert.equal(program.programId.toBase58(), "FKWs2cd5E9Fi8t2Gqbq6SkgekL4MJwZgkRMrGFcPGVvt");
+    const publishedIdl = JSON.parse(readFileSync("idl/tangem_gacha_vault.json", "utf8"));
+    assert.equal(program.programId.toBase58(), publishedIdl.address,
+      "Workspace program ID differs from the committed IDL");
     const instructions = (program.idl as any).instructions;
     const names = instructions.map((i: any) => snake(i.name)).sort();
     assert.deepEqual(names, [
