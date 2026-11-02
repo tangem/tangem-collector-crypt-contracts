@@ -8,10 +8,33 @@ proceeds go directly to the owner's wallet.
 
 ## Release and deployment status
 
-This tree contains the **nine-instruction Day 1 program**. Its local/devnet
-program id is `FKWs2cd5E9Fi8t2Gqbq6SkgekL4MJwZgkRMrGFcPGVvt`. This is a
-new deployment identity; it has **not been deployed**. A separate mainnet
+This tree contains the **nine-instruction Day 1 program**, deployed to
+**devnet on 2026-11-02** at
+[`FKWs2cd5E9Fi8t2Gqbq6SkgekL4MJwZgkRMrGFcPGVvt`](https://explorer.solana.com/address/FKWs2cd5E9Fi8t2Gqbq6SkgekL4MJwZgkRMrGFcPGVvt?cluster=devnet),
+slot `517670608`.
+The deployed sBPF v3 executable matches the reviewed 367,392-byte artifact:
+SHA-256 `6492ac4c8465d0724b8666fde81da1a0542f02f62253e75415208aa7954b4260`.
+ProgramData is `Fqm28fSfaeCj6zPVjGBGdJq5kEiqz56HNnH4Bmq7fhg3`, with
+400,000 bytes allocated for code and a verified zero-filled tail. Upgrade
+authority is the devnet test signer
+`CfzgiAsor8k46oAr1zLybapCbAK44892DYxBJUerNX31`. A separate mainnet
 program id and deployment configuration are still to be selected.
+
+The new Config was initialized and read back successfully on devnet:
+
+| Parameter | Verified value |
+|---|---|
+| Config PDA | `2jrR9vtzhxYiuxB5aTKWQvgH8FVp3xcC9EinhMGwbsZt` |
+| Admin | `CfzgiAsor8k46oAr1zLybapCbAK44892DYxBJUerNX31` |
+| CC dev-USDC mint | `Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr` (legacy SPL, 6 decimals) |
+| CC treasury token account | `9ZSgA3PMjeAU8K6CWzgJ8oDnhZwwSgHZu6KP3X95t7Jq` |
+| Fee treasury token account | `9qsWLjBgicHNncaM1qtLb4jqj4a4NixMwvNXNmsqQyV9` (test admin's ATA) |
+| Fee corridor / pause | 100–500 bps / `false` |
+
+These are devnet test values, including the shared admin/sponsor/fee wallet.
+The [initialization transaction](https://explorer.solana.com/tx/5Vu2oXojsH4VRgNQQpKcPn9N1vjLUoKEv5vdWUNZutR9xpsCoCS3dv2LpNQZJuefXF9RGfHpChr3eGYcyTixydU?cluster=devnet)
+and decoded state are recorded locally in
+`target/verification/day1-config/config.confirmed.json`.
 
 The full custody implementation is preserved at Git tag **`custody-full`**
 (commit `a00e8c8`). The existing devnet program
@@ -19,9 +42,25 @@ The full custody implementation is preserved at Git tag **`custody-full`**
 last recorded at slot `499213881`. It has not been upgraded to this tree.
 Use the archived IDL for that program, not this tree's IDL.
 
-Mainnet integration testing and a public product launch are separate
-milestones. This document does not assert a deployment, an external audit,
-or production readiness for the new build.
+Deployment evidence is recorded locally in
+`target/verification/day1-devnet-deployment.json`. A devnet smoke completed
+sponsored onboarding → 55 dev-USDC funding → `pokemon_50` purchase → Core
+prize delivery to owner → withdrawal and account closure. The
+[purchase](https://explorer.solana.com/tx/5b7UBj4UkzVeDbsumTR51LksRNDkaaEHNuUMAYdWA2rS4mmDX2XRN46TgLgG2YJ4gjoN8aPvn8tEcFBiS226Bpha?cluster=devnet)
+paid 50 dev-USDC principal plus a 0.5 dev-USDC fee at slot `518023881`.
+CC delivered [the Core prize](https://explorer.solana.com/address/GZFPHF4B5n3AK5QDpxKVVgnpemmHRMsiZ7U47A5UgTt6?cluster=devnet)
+to the owner. The [cleanup](https://explorer.solana.com/tx/2xba458XJjRG55yQyzxaLVZReRS4328ZSWnfJdGqUHr44mDAsA7qDWbF2pQSUjxvqbJfj9D3iZHAxyvmHEJEzoJX?cluster=devnet)
+returned the remaining 4.5 dev-USDC to the sponsor and 2,834,640 rent
+lamports to the owner, closing both vault and ATA. The journal is
+`target/verification/day1-smoke.json`.
+
+Owner, session and sponsor were distinct software keys; owner/session held
+zero SOL through purchase and prize delivery. The sponsor paid transaction
+fees and onboarding rent. A separate purchase simulation used 26,903 CU
+and left live state unchanged. This run did not exercise a Tangem card,
+the mobile app, the central Gasless service, turbo or buyback. Mainnet
+integration testing, external audit and public product launch remain
+separate milestones.
 
 ## Scope and roles
 
@@ -86,7 +125,8 @@ The eight accounts, in order, are `config`, `vault` (w), `session_key` (s),
 `token_program`. Submit the custom payment through RPC, then continue CC's
 `openPack`/status flow with the bare join key. CC must recognize inner token
 transfers; the previous deployment's devnet integration demonstrated this,
-but the new deployment needs its own end-to-end run.
+and the current Day 1 devnet smoke reconfirmed payment recognition and Core
+prize delivery to owner.
 
 The program neither validates CC's pack price nor binds a memo to a prize
 recipient. It also does not check that the top-level Memo exists or matches
@@ -173,7 +213,7 @@ they do not automatically make an arbitrary upgrade compatible.
 
 | Area | Full custody release (`custody-full`) | Day 1 build |
 |---|---|---|
-| Program | Existing devnet `29agFEru…` | New, undeployed local/devnet `FKWs2cd5…`; separate mainnet id later |
+| Program | Existing devnet `29agFEru…`, unchanged | Devnet `FKWs2cd5…`, deployed at slot `517670608`; separate mainnet id later |
 | Instructions | 18 | 9 |
 | Seven user instructions | Vault lifecycle, purchase and generic owner withdrawals | Same names, discriminators, arguments and account order/flags; different program/PDA addresses |
 | `initialize_config` | Gacha wallet, two treasuries, corridor, delegation flag | Two treasuries and corridor only; same discriminator and account list |
@@ -272,11 +312,12 @@ solana-keygen pubkey target/deploy/tangem_gacha_vault-keypair.json
 
 Use that public key in `declare_id!` in `programs/tangem-gacha-vault/src/lib.rs`,
 both `[programs.localnet]` and `[[test.genesis]].address` in `Anchor.toml`,
-and this README's current local/devnet address and compatibility-table entry.
-If the private `INTEGRATION.md` is present, update its current address too.
-Keep historical deployment addresses and verification hashes as historical
-records: changing the program id produces a different binary and new PDAs.
-The local identity is not a deployed Tangem program. Configure
+and document that local identity separately in this README (and the private
+`INTEGRATION.md`, if present). Keep the recorded devnet identities, slots and
+hashes unchanged: changing the program id produces a different binary and
+new PDAs. The generated local identity is not a deployed Tangem program;
+the pinned devnet operational scripts below still target the existing
+Tangem devnet deployment. Configure
 `[provider].wallet` in `Anchor.toml` to an available local-test payer keypair.
 
 Then run the build and checks below. The build regenerates the local IDL and
@@ -366,9 +407,36 @@ artifact path. Use a local-test payer keypair; the script sends no devnet or
 mainnet transactions. These local runs do not establish CC live e2e or
 external audit completion.
 
-The remaining devnet scripts are `scripts/devnet/common.js` and
-`vault_spin.js`. Their target program, configured mint and treasury accounts
-must match the new deployment. Before the first mainnet test, select the
+The deployment-specific scripts are
+[`initialize_config.js`](scripts/devnet/initialize_config.js) and
+[`day1_smoke.js`](scripts/devnet/day1_smoke.js). They pin the new devnet
+program, test mint, treasury accounts and test signer; they cannot be reused
+for another cluster or a locally generated program identity unchanged.
+
+```bash
+node scripts/devnet/initialize_config.js --check
+node scripts/devnet/initialize_config.js --execute
+node scripts/devnet/day1_smoke.js --setup
+node scripts/devnet/day1_smoke.js --simulate
+node scripts/devnet/day1_smoke.js --status
+```
+
+The initializer verifies the deployed artifact and exact Config settings;
+an already matching Config is accepted without sending another transaction.
+It never updates or migrates the old program's Config. Smoke setup creates
+one vault with distinct owner/session/sponsor keys and funds it with 55
+dev-USDC. `--simulate` checks a 50 dev-USDC purchase plus a 0.5 dev-USDC fee
+without broadcasting that purchase. For a live CC run, supply `CC_API_KEY`
+securely through the environment and run `--spin` before `--cleanup`.
+`--cleanup` withdraws the remaining dev-USDC to the sponsor and closes the
+vault/ATA; their rent goes to the owner. Cleanup ends this journaled run.
+The initializer and smoke write durable transaction journals under
+`target/verification`; an unresolved signature blocks a replacement payment.
+Never delete a journal to retry a transaction.
+
+`scripts/devnet/common.js` and `vault_spin.js` remain historical integration
+helpers; `vault_spin.js` uses one key for owner/session and is not the
+distinct-role sponsorship smoke. Before the first mainnet test, select the
 program id, actual mint, both existing treasury token accounts, fee corridor,
 admin/upgrade roles and sponsor; then initialize and verify those concrete
 values. Record the deployed binary hash and slot after deployment, and run
