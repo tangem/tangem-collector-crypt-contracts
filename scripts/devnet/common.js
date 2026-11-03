@@ -12,7 +12,7 @@ const API = "https://dev-gacha.collectorcrypt.com/api";
 // only, no funds behind it. Override for other environments — never hardcode
 // a prod key here.
 // Checked lazily in post()/get(): only the CC API calls need the key — the
-// on-chain-only scripts (vault_buyback_atomic.js) must run without it.
+// setup and account reads do not need a CC API key.
 const KEY = process.env.CC_API_KEY;
 const requireKey = () => {
   if (!KEY) throw new Error("set CC_API_KEY (dev API key from CC)");
@@ -40,14 +40,15 @@ function load() {
   const conn = new Connection(RPC, "confirmed");
   const provider = new anchor.AnchorProvider(conn, new anchor.Wallet(player), { commitment: "confirmed" });
   anchor.setProvider(provider);
-  const idl = JSON.parse(fs.readFileSync(path.join(REPO, "target", "idl", "tangem_gacha_vault.json")));
+  const idl = JSON.parse(fs.readFileSync(path.join(REPO, "idl", "tangem_gacha_vault.json")));
+  if (idl.instructions.length !== 9) throw new Error("Expected the Day 1 IDL (9 instructions)");
   const program = new anchor.Program(idl, provider);
   const [configPda] = PublicKey.findProgramAddressSync([Buffer.from("config")], program.programId);
   const [vaultPda] = PublicKey.findProgramAddressSync(
     [Buffer.from("vault"), player.publicKey.toBuffer()], program.programId);
   const vaultUsdc = getAssociatedTokenAddressSync(USDC, vaultPda, true);
   const playerUsdc = getAssociatedTokenAddressSync(USDC, player.publicKey);
-  return { player, conn, provider, program, configPda, vaultPda, vaultUsdc, playerUsdc, feeUsdc: playerUsdc };
+  return { player, conn, provider, program, configPda, vaultPda, vaultUsdc, playerUsdc };
 }
 
 const post = (ep, body) => fetch(`${API}/${ep}`, {

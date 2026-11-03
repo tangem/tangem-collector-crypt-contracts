@@ -34,7 +34,14 @@ fn vault_pda(cold: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[VAULT_SEED, cold.as_ref()], &PROGRAM_ID)
 }
 
-fn init_vault_ix(vault: Pubkey, cold: Pubkey, payer: Pubkey, hot: Pubkey, per: u64, daily: u64) -> Instruction {
+fn init_vault_ix(
+    vault: Pubkey,
+    cold: Pubkey,
+    payer: Pubkey,
+    hot: Pubkey,
+    per: u64,
+    daily: u64,
+) -> Instruction {
     Instruction {
         program_id: PROGRAM_ID,
         accounts: accounts::InitVault {
@@ -62,7 +69,14 @@ fn init_vault_executes_and_persists_state() {
     svm.airdrop(&payer.pubkey(), 5_000_000_000).unwrap();
 
     let (vault, _) = vault_pda(&cold.pubkey());
-    let ix = init_vault_ix(vault, cold.pubkey(), payer.pubkey(), hot.pubkey(), 300_000_000, 1_000_000_000);
+    let ix = init_vault_ix(
+        vault,
+        cold.pubkey(),
+        payer.pubkey(),
+        hot.pubkey(),
+        300_000_000,
+        1_000_000_000,
+    );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
         Some(&payer.pubkey()),
@@ -81,8 +95,19 @@ fn init_vault_executes_and_persists_state() {
     assert_eq!(v.per_spin_cap, 300_000_000);
     assert_eq!(v.daily_cap, 1_000_000_000);
     assert_eq!(v.spent_today, 0);
-    assert!(v.live_buyback_mint.is_none());
-    assert!(v.live_buyback_token.is_none());
+    assert_eq!(acct.data.len(), 137, "Day 1 Vault allocation");
+    assert_eq!(v._reserved, [0; 32], "growth padding starts empty");
+    assert_eq!(
+        svm.get_balance(&cold.pubkey()).unwrap_or(0),
+        0,
+        "owner needs no SOL"
+    );
+    assert_eq!(
+        svm.get_balance(&hot.pubkey()).unwrap_or(0),
+        0,
+        "session key needs no SOL"
+    );
+    assert_eq!(acct.lamports, svm.minimum_balance_for_rent_exemption(137));
 }
 
 #[test]
@@ -95,7 +120,14 @@ fn init_vault_rejects_invalid_caps() {
 
     let (vault, _) = vault_pda(&cold.pubkey());
     // daily_cap < per_spin_cap must be rejected by the InvalidCaps require!.
-    let ix = init_vault_ix(vault, cold.pubkey(), payer.pubkey(), hot.pubkey(), 1_000_000_000, 10_000_000);
+    let ix = init_vault_ix(
+        vault,
+        cold.pubkey(),
+        payer.pubkey(),
+        hot.pubkey(),
+        1_000_000_000,
+        10_000_000,
+    );
     let tx = Transaction::new_signed_with_payer(
         &[ix],
         Some(&payer.pubkey()),
@@ -106,7 +138,10 @@ fn init_vault_rejects_invalid_caps() {
         svm.send_transaction(tx).is_err(),
         "init_vault must reject daily_cap < per_spin_cap"
     );
-    assert!(svm.get_account(&vault).map(|a| a.data.is_empty()).unwrap_or(true));
+    assert!(svm
+        .get_account(&vault)
+        .map(|a| a.data.is_empty())
+        .unwrap_or(true));
 }
 
 #[test]
@@ -118,7 +153,14 @@ fn init_vault_requires_cold_signature() {
     svm.airdrop(&payer.pubkey(), 5_000_000_000).unwrap();
 
     let (vault, _) = vault_pda(&cold.pubkey());
-    let ix = init_vault_ix(vault, cold.pubkey(), payer.pubkey(), hot.pubkey(), 300_000_000, 1_000_000_000);
+    let ix = init_vault_ix(
+        vault,
+        cold.pubkey(),
+        payer.pubkey(),
+        hot.pubkey(),
+        300_000_000,
+        1_000_000_000,
+    );
     // Sign with payer only — owner is a required Signer, so the SVM must
     // reject it. (`new_signed_with_payer` would panic client-side with
     // NotEnoughSigners before reaching the SVM, hence partial_sign.)

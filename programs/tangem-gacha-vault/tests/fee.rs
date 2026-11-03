@@ -1,20 +1,6 @@
-//! Fee-corridor and Config-migration tests on real bytecode (LiteSVM).
-//!
-//! Covers the release that replaced the single global `fee_bps` with the
-//! `[min_fee_bps, max_fee_bps]` corridor and the backend-supplied `fee_amount`
-//! of `purchase_pack`:
-//! - the Config byte layout the migration and raw readers depend on
-//!   (176 bytes, `min_fee_bps` at 168, `max_fee_bps` appended at 174);
-//! - `require_fee_in_corridor` at its exact boundaries (floor on the lower
-//!   bound, cross-multiplication on the upper, hard `MAX_FEE_BPS` backstop
-//!   that no config image can lift);
-//! - `migrate_config` against a 174-byte LEGACY image exactly like the live
-//!   devnet one (`fee_bps` = 100, `_reserved` = 1), incl. the 3003 window
-//!   before the migration, idempotence, and its authorization;
-//! - `update_config` corridor validation and the ConfigUpdated event;
-//! - the spending caps being charged with `amount + fee_amount`.
-//!
-//! Run `anchor build` first so target/deploy/tangem_gacha_vault.so exists.
+//! Day 1 fee corridor, published ABI and spending tests on real bytecode.
+//! Config and Vault are fresh accounts under a new program ID; custody and
+//! migration selectors must not remain callable. Run `anchor build` first.
 
 mod common;
 
@@ -32,8 +18,8 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use tangem_gacha_vault::{
-    accounts, instruction, Config, ConfigUpdated, PackOpened, Vault, CONFIG_LEGACY_LEN,
-    CONFIG_MAX_FEE_OFFSET, CONFIG_MIN_FEE_OFFSET, CONFIG_SEED, MAX_FEE_BPS, VAULT_SEED,
+    accounts, instruction, Config, ConfigUpdated, PackOpened, Vault, VaultError, CONFIG_SEED,
+    MAX_FEE_BPS, VAULT_SEED,
 };
 
 const PROGRAM_ID: Pubkey = tangem_gacha_vault::ID;
@@ -41,11 +27,9 @@ const TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623
 const ATA_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 /// Default caps: generous, so only the fee logic binds in the corridor tests.
 const D: u64 = 300_000_000;
-/// The planned devnet corridor after migration: 1% .. 5%.
+/// Test corridor: 1% .. 5%.
 const MIN_BPS: u16 = 100;
 const MAX_BPS: u16 = 500;
-/// `_reserved` as the live devnet Config carries it (Plan-B era value).
-const LIVE_RESERVED: u8 = 1;
 /// Discriminator of the REMOVED `open_pack` (sha256("global:open_pack")[..8]).
 const OLD_OPEN_PACK_DISCRIMINATOR: [u8; 8] = [75, 203, 144, 65, 63, 253, 103, 85];
 
@@ -109,7 +93,14 @@ fn create_ata(svm: &mut LiteSVM, payer: &Keypair, owner: &Pubkey, mint: &Pubkey)
     addr
 }
 
-fn mint_to(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, dest: &Pubkey, authority: &Keypair, amount: u64) {
+fn mint_to(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    dest: &Pubkey,
+    authority: &Keypair,
+    amount: u64,
+) {
     let mut data = vec![7u8];
     data.extend_from_slice(&amount.to_le_bytes());
     let ix = Instruction {
@@ -145,12 +136,11 @@ struct World {
     vault: Pubkey,
     vault_usdc: Pubkey,
     config: Pubkey,
-    gacha_wallet: Pubkey,
     gacha_usdc: Pubkey,
     fee_usdc: Pubkey,
 }
 
-/// The planned devnet corridor (1% .. 5%) with caps that never bind.
+/// A test corridor (1% .. 5%) with caps that never bind.
 fn setup() -> World {
     setup_with(MIN_BPS, MAX_BPS, D, 100 * D)
 }
@@ -169,11 +159,12 @@ fn setup_with(min_fee_bps: u16, max_fee_bps: u16, per_spin_cap: u64, daily_cap: 
     }
 
     let mint = create_mint(&mut svm, &payer, &payer.pubkey());
-    let (vault, _) = Pubkey::find_program_address(&[VAULT_SEED, cold.pubkey().as_ref()], &PROGRAM_ID);
+    let (vault, _) =
+        Pubkey::find_program_address(&[VAULT_SEED, cold.pubkey().as_ref()], &PROGRAM_ID);
     let vault_usdc = create_ata(&mut svm, &payer, &vault, &mint);
     mint_to(&mut svm, &payer, &mint, &vault_usdc, &payer, 1_000 * D);
-    let gacha_wallet = Keypair::new().pubkey();
-    let gacha_usdc = create_ata(&mut svm, &payer, &gacha_wallet, &mint);
+    let gacha_owner = Keypair::new().pubkey();
+    let gacha_usdc = create_ata(&mut svm, &payer, &gacha_owner, &mint);
     let fee_owner = Keypair::new();
     let fee_usdc = create_ata(&mut svm, &payer, &fee_owner.pubkey(), &mint);
 
@@ -188,13 +179,12 @@ fn setup_with(min_fee_bps: u16, max_fee_bps: u16, per_spin_cap: u64, daily_cap: 
         vault,
         vault_usdc,
         config,
-        gacha_wallet,
         gacha_usdc,
         fee_usdc,
     };
     // Config written directly (initialize_config's upgrade-authority gate needs
     // ProgramData, which litesvm's add_program does not create).
-    let image = config_image(&w, min_fee_bps, max_fee_bps, 0);
+    let image = config_image(&w, min_fee_bps, max_fee_bps);
     write_config(&mut w, image);
 
     let ix = Instruction {
@@ -206,7 +196,12 @@ fn setup_with(min_fee_bps: u16, max_fee_bps: u16, per_spin_cap: u64, daily_cap: 
             system_program: system_program::ID,
         }
         .to_account_metas(None),
-        data: instruction::InitVault { session_key: w.hot.pubkey(), per_spin_cap, daily_cap }.data(),
+        data: instruction::InitVault {
+            session_key: w.hot.pubkey(),
+            per_spin_cap,
+            daily_cap,
+        }
+        .data(),
     };
     let tx = Transaction::new_signed_with_payer(
         &[ix],
@@ -218,21 +213,19 @@ fn setup_with(min_fee_bps: u16, max_fee_bps: u16, per_spin_cap: u64, daily_cap: 
     w
 }
 
-/// Full 176-byte serialization of a Config for this world (discriminator
+/// Full 174-byte serialization of a Config for this world (discriminator
 /// included). The corridor is NOT validated here on purpose: tests use this
 /// to plant images `update_config` would refuse.
-fn config_image(w: &World, min_fee_bps: u16, max_fee_bps: u16, reserved: u8) -> Vec<u8> {
+fn config_image(w: &World, min_fee_bps: u16, max_fee_bps: u16) -> Vec<u8> {
     let (_, bump) = Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID);
     let cfg = Config {
         admin: w.admin.pubkey(),
         usdc_mint: w.mint,
-        gacha_wallet: w.gacha_wallet,
         gacha_usdc_account: w.gacha_usdc,
         fee_usdc_account: w.fee_usdc,
         min_fee_bps,
         paused: false,
-        _reserved: reserved,
-        allow_buyback_delegation: false,
+        _reserved: [0; 32],
         bump,
         max_fee_bps,
     };
@@ -241,27 +234,21 @@ fn config_image(w: &World, min_fee_bps: u16, max_fee_bps: u16, reserved: u8) -> 
     data
 }
 
-/// Plants `data` as the config PDA, rent-exempt for exactly its own length —
-/// so a legacy-sized image forces `migrate_config` through the top-up path.
+/// Plants a test Config image at its PDA, funded for its full allocation.
 fn write_config(w: &mut World, data: Vec<u8>) {
     let lamports = w.svm.minimum_balance_for_rent_exemption(data.len());
     w.svm
         .set_account(
             w.config,
-            Account { lamports, data, owner: PROGRAM_ID, executable: false, rent_epoch: 0 },
+            Account {
+                lamports,
+                data,
+                owner: PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
         )
         .unwrap();
-}
-
-/// A pre-corridor Config exactly as the live devnet one is laid out: 174
-/// bytes, the old `fee_bps` at 168, no `max_fee_bps`. `max_fee_bps` was
-/// appended AFTER every legacy field, so truncating the new serialization is
-/// the legacy image by construction (`config_layout_is_pinned` proves the
-/// offsets this relies on).
-fn write_legacy_config(w: &mut World, fee_bps: u16, reserved: u8) {
-    let mut data = config_image(w, fee_bps, 0, reserved);
-    data.truncate(CONFIG_LEGACY_LEN);
-    write_config(w, data);
 }
 
 fn read_config(w: &World) -> Config {
@@ -320,21 +307,6 @@ fn spin(w: &mut World, amount: u64, fee_amount: u64, tag: &str) -> Result<Vec<St
     send(w, ix, &[&hot])
 }
 
-/// `migrate_config(max_fee_bps)` signed (and rent-paid) by `signer`.
-fn migrate(w: &mut World, signer: &Keypair, max_fee_bps: u16) -> Result<Vec<String>, String> {
-    let ix = Instruction {
-        program_id: PROGRAM_ID,
-        accounts: accounts::MigrateConfig {
-            config: w.config,
-            admin: signer.pubkey(),
-            system_program: system_program::ID,
-        }
-        .to_account_metas(None),
-        data: instruction::MigrateConfig { max_fee_bps }.data(),
-    };
-    send(w, ix, &[signer])
-}
-
 /// `update_config` touching only the corridor, signed by `signer`.
 fn update_fees(
     w: &mut World,
@@ -344,17 +316,18 @@ fn update_fees(
 ) -> Result<Vec<String>, String> {
     let ix = Instruction {
         program_id: PROGRAM_ID,
-        accounts: accounts::UpdateConfig { config: w.config, admin: signer.pubkey() }
-            .to_account_metas(None),
+        accounts: accounts::UpdateConfig {
+            config: w.config,
+            admin: signer.pubkey(),
+        }
+        .to_account_metas(None),
         data: instruction::UpdateConfig {
             new_admin: None,
-            gacha_wallet: None,
             gacha_usdc_account: None,
             fee_usdc_account: None,
             min_fee_bps,
             max_fee_bps,
             paused: None,
-            allow_buyback_delegation: None,
         }
         .data(),
     };
@@ -370,62 +343,64 @@ fn floor_fee(amount: u64, bps: u16) -> u64 {
 // 1. Layout & wire pins
 // ---------------------------------------------------------------------------
 
-/// The migration and every raw reader (backend, devnet scripts) address Config
-/// by byte offset; this pins the borsh layout to the published constants.
+/// Raw state readers depend on this Day 1 schema, independently of Rust names.
 #[test]
-fn config_layout_is_pinned() {
-    assert_eq!(8 + Config::INIT_SPACE, 176, "Config grew or shrank");
-    assert_eq!(CONFIG_LEGACY_LEN, 174);
-    assert_eq!(CONFIG_MIN_FEE_OFFSET, 168);
-    assert_eq!(CONFIG_MAX_FEE_OFFSET, 174);
-    assert_eq!(
-        CONFIG_MAX_FEE_OFFSET, CONFIG_LEGACY_LEN,
-        "max_fee_bps must be appended exactly where the legacy image ends"
-    );
+fn day1_account_layouts_are_pinned() {
+    // The schema is independent of the deployment identity. Runtime tests use
+    // the current declare_id!, so a binary built for another ID still fails.
+    assert_eq!(8 + Config::INIT_SPACE, 174);
+    assert_eq!(8 + Vault::INIT_SPACE, 137);
     assert_eq!(MAX_FEE_BPS, 1_000);
-
-    // Distinctive values so a shifted field cannot masquerade as a neighbour.
-    let (_, bump) = Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID);
-    let admin = Pubkey::new_unique();
-    let cfg = Config {
-        admin,
+    let config = Config {
+        admin: Pubkey::new_unique(),
         usdc_mint: Pubkey::new_unique(),
-        gacha_wallet: Pubkey::new_unique(),
         gacha_usdc_account: Pubkey::new_unique(),
         fee_usdc_account: Pubkey::new_unique(),
         min_fee_bps: 0x1234,
-        paused: true,
-        _reserved: 0xAB,
-        allow_buyback_delegation: false,
-        bump,
         max_fee_bps: 0x5678,
+        paused: true,
+        bump: 0xAB,
+        _reserved: [0xCD; 32],
     };
     let mut data = Vec::new();
-    cfg.try_serialize(&mut data).unwrap();
-    assert_eq!(data.len(), 176);
-    assert_eq!(&data[..8], Config::DISCRIMINATOR);
-    assert_eq!(&data[8..40], admin.as_ref(), "admin at 8..40 (migrate_config reads it raw)");
-    assert_eq!(
-        &data[CONFIG_MIN_FEE_OFFSET..CONFIG_MIN_FEE_OFFSET + 2],
-        &0x1234u16.to_le_bytes(),
-        "min_fee_bps occupies the legacy fee_bps slot"
-    );
-    assert_eq!(data[170], 1, "paused");
-    assert_eq!(data[171], 0xAB, "_reserved");
-    assert_eq!(data[172], 0, "allow_buyback_delegation");
-    assert_eq!(data[173], bump, "bump");
-    assert_eq!(
-        &data[CONFIG_MAX_FEE_OFFSET..CONFIG_MAX_FEE_OFFSET + 2],
-        &0x5678u16.to_le_bytes(),
-        "max_fee_bps appended after bump"
-    );
-    // The truncation `write_legacy_config` relies on: `max_fee_bps` influences
-    // nothing before offset 174, so the legacy image is a strict prefix of the
-    // new one whatever the ceiling is.
-    let mut other = Vec::new();
-    Config { max_fee_bps: 0, ..cfg }.try_serialize(&mut other).unwrap();
-    assert_eq!(&other[..CONFIG_LEGACY_LEN], &data[..CONFIG_LEGACY_LEN], "legacy prefix");
-    assert_ne!(&other[CONFIG_LEGACY_LEN..], &data[CONFIG_LEGACY_LEN..]);
+    config.try_serialize(&mut data).unwrap();
+    assert_eq!(data.len(), 174);
+    assert_eq!(&data[..8], &[155, 12, 170, 224, 30, 250, 204, 130]);
+    for (offset, key) in [
+        (8, config.admin),
+        (40, config.usdc_mint),
+        (72, config.gacha_usdc_account),
+        (104, config.fee_usdc_account),
+    ] {
+        assert_eq!(&data[offset..offset + 32], key.as_ref());
+    }
+    assert_eq!(&data[136..138], &0x1234u16.to_le_bytes());
+    assert_eq!(&data[138..140], &0x5678u16.to_le_bytes());
+    assert_eq!(&data[140..142], &[1, 0xAB]);
+    assert_eq!(&data[142..174], &[0xCD; 32]);
+
+    let vault = Vault {
+        owner: Pubkey::new_unique(),
+        session_key: Pubkey::new_unique(),
+        per_spin_cap: 11,
+        daily_cap: 22,
+        spent_today: 7,
+        day_index: -3,
+        bump: 0xEF,
+        _reserved: [0x98; 32],
+    };
+    data.clear();
+    vault.try_serialize(&mut data).unwrap();
+    assert_eq!(data.len(), 137);
+    assert_eq!(&data[..8], &[211, 8, 232, 43, 2, 152, 117, 119]);
+    assert_eq!(&data[8..40], vault.owner.as_ref());
+    assert_eq!(&data[40..72], vault.session_key.as_ref());
+    for (offset, value) in [(72, 11u64), (80, 22), (88, 7)] {
+        assert_eq!(&data[offset..offset + 8], &value.to_le_bytes());
+    }
+    assert_eq!(&data[96..104], &(-3i64).to_le_bytes());
+    assert_eq!(data[104], 0xEF);
+    assert_eq!(&data[105..137], &[0x98; 32]);
 }
 
 /// Discriminators the backend and CC's indexer hardcode, per the release spec.
@@ -435,11 +410,6 @@ fn wire_discriminators_are_pinned() {
         instruction::PurchasePack::DISCRIMINATOR,
         &[43, 116, 135, 75, 251, 67, 81, 26],
         "purchase_pack"
-    );
-    assert_eq!(
-        instruction::MigrateConfig::DISCRIMINATOR,
-        &[92, 131, 58, 105, 210, 154, 224, 193],
-        "migrate_config"
     );
     assert_eq!(
         PackOpened::DISCRIMINATOR,
@@ -468,7 +438,11 @@ fn old_open_pack_discriminator_is_rejected() {
     let memo = b"fee-test-legacy:open";
     data.extend_from_slice(&(memo.len() as u32).to_le_bytes());
     data.extend_from_slice(memo);
-    let ix = Instruction { program_id: PROGRAM_ID, accounts: purchase_pack_metas(&w), data };
+    let ix = Instruction {
+        program_id: PROGRAM_ID,
+        accounts: purchase_pack_metas(&w),
+        data,
+    };
     let hot = w.hot.insecure_clone();
     let err = send(&mut w, ix, &[&hot]).expect_err("open_pack no longer exists");
     assert!(err.contains("InstructionFallbackNotFound"), "got:\n{err}");
@@ -489,7 +463,7 @@ fn corridor_boundaries_on_round_amount() {
     assert_eq!((min, max), (100, 500));
 
     let logs = spin(&mut w, amount, min, "min").expect("fee == floor(amount*min/1e4) passes");
-    let ev: PackOpened = common::decode_event(&logs).expect("PackOpened emitted");
+    let ev: common::PackOpenedWire = common::decode_event(&logs).expect("PackOpened emitted");
     assert_eq!(ev.vault, w.vault);
     assert_eq!(ev.owner, w.cold.pubkey());
     assert_eq!(ev.amount, amount);
@@ -547,9 +521,16 @@ fn corridor_boundaries_on_fractional_amount() {
 #[test]
 fn any_floored_rate_inside_corridor_passes() {
     let mut w = setup();
-    for (i, (amount, bps)) in [(7_777u64, 100u16), (7_777, 250), (7_777, 333), (7_777, 500), (3, 100), (3, 500)]
-        .into_iter()
-        .enumerate()
+    for (i, (amount, bps)) in [
+        (7_777u64, 100u16),
+        (7_777, 250),
+        (7_777, 333),
+        (7_777, 500),
+        (3, 100),
+        (3, 500),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let fee = floor_fee(amount, bps);
         spin(&mut w, amount, fee, &format!("rate-{i}"))
@@ -567,7 +548,7 @@ fn any_floored_rate_inside_corridor_passes() {
 #[test]
 fn hard_backstop_ignores_planted_config_ceiling() {
     let mut w = setup();
-    let image = config_image(&w, 0, 5_000, 0);
+    let image = config_image(&w, 0, 5_000);
     write_config(&mut w, image);
     assert_eq!(read_config(&w).max_fee_bps, 5_000, "planted image is live");
 
@@ -579,153 +560,6 @@ fn hard_backstop_ignores_planted_config_ceiling() {
     // Exactly 10% is the ceiling itself, and the planted config allows it.
     spin(&mut w, amount, 1_000, "10pct").expect("exactly MAX_FEE_BPS passes");
     assert_eq!(token_amount(&w.svm, &w.fee_usdc), 1_000);
-}
-
-// ---------------------------------------------------------------------------
-// 4. migrate_config
-// ---------------------------------------------------------------------------
-
-/// The devnet upgrade path end to end: legacy image -> 3003 window ->
-/// migrate_config(500) -> corridor [100, 500], `_reserved` untouched -> spins.
-#[test]
-fn migrate_config_upgrades_legacy_image() {
-    let mut w = setup();
-    write_legacy_config(&mut w, 100, LIVE_RESERVED);
-    let legacy = w.svm.get_account(&w.config).unwrap();
-    assert_eq!(legacy.data.len(), CONFIG_LEGACY_LEN);
-    let legacy_rent = legacy.lamports;
-
-    // Before the migration every Config reader is down.
-    let err = spin(&mut w, 10_000, 100, "pre").expect_err("legacy image cannot deserialize");
-    assert!(err.contains("AccountDidNotDeserialize"), "got:\n{err}");
-    assert!(err.contains("3003"), "got:\n{err}");
-
-    let admin = w.admin.insecure_clone();
-    let admin_before = w.svm.get_account(&admin.pubkey()).unwrap().lamports;
-    let logs = migrate(&mut w, &admin, MAX_BPS).expect("admin migrates");
-    let ev: ConfigUpdated = common::decode_event(&logs).expect("ConfigUpdated emitted");
-    assert_eq!(ev.admin, admin.pubkey());
-    assert_eq!(ev.gacha_wallet, w.gacha_wallet);
-    assert_eq!(ev.gacha_usdc_account, w.gacha_usdc);
-    assert_eq!(ev.fee_usdc_account, w.fee_usdc);
-    assert_eq!((ev.min_fee_bps, ev.max_fee_bps), (100, MAX_BPS));
-    assert!(!ev.paused);
-    assert!(!ev.allow_buyback_delegation);
-
-    let acc = w.svm.get_account(&w.config).unwrap();
-    assert_eq!(acc.data.len(), 8 + Config::INIT_SPACE);
-    assert_eq!(acc.owner, PROGRAM_ID);
-    let required = w.svm.minimum_balance_for_rent_exemption(acc.data.len());
-    assert!(acc.lamports >= required, "resized account stays rent-exempt");
-    assert!(acc.lamports > legacy_rent, "the two extra bytes were paid for");
-    let admin_after = w.svm.get_account(&admin.pubkey()).unwrap().lamports;
-    assert!(
-        admin_before - admin_after >= acc.lamports - legacy_rent,
-        "the admin paid the top-up"
-    );
-
-    let cfg = read_config(&w);
-    assert_eq!(cfg.admin, admin.pubkey());
-    assert_eq!(cfg.usdc_mint, w.mint);
-    assert_eq!(cfg.min_fee_bps, 100, "old fee_bps became the floor in place");
-    assert_eq!(cfg.max_fee_bps, MAX_BPS);
-    assert_eq!(cfg._reserved, LIVE_RESERVED, "_reserved survives the migration");
-    assert!(!cfg.paused);
-
-    // The corridor is live: 1% passes, below it does not.
-    spin(&mut w, 10_000, 100, "post").expect("spins work after the migration");
-    let err = spin(&mut w, 10_000, 99, "post-low").expect_err("floor enforced");
-    assert!(err.contains("FeeBelowMinimum"), "got:\n{err}");
-}
-
-/// Running the migration twice is harmless: the second call returns before
-/// touching anything (no resize, no event, argument ignored).
-#[test]
-fn migrate_config_is_idempotent() {
-    let mut w = setup();
-    write_legacy_config(&mut w, 100, LIVE_RESERVED);
-    let admin = w.admin.insecure_clone();
-    migrate(&mut w, &admin, MAX_BPS).expect("first migration");
-    let after_first = w.svm.get_account(&w.config).unwrap();
-
-    let logs = migrate(&mut w, &admin, 700).expect("second call is a no-op, not an error");
-    assert!(
-        common::decode_event::<ConfigUpdated>(&logs).is_none(),
-        "no-op must not emit ConfigUpdated"
-    );
-    let after_second = w.svm.get_account(&w.config).unwrap();
-    assert_eq!(after_second.data, after_first.data, "bytes untouched");
-    assert_eq!(after_second.lamports, after_first.lamports, "no second top-up");
-    assert_eq!(read_config(&w).max_fee_bps, MAX_BPS, "the 700 was ignored");
-
-    // Also a no-op on a config that never needed migrating.
-    let mut w = setup();
-    let before = w.svm.get_account(&w.config).unwrap();
-    let admin = w.admin.insecure_clone();
-    migrate(&mut w, &admin, 900).expect("already-new config");
-    assert_eq!(w.svm.get_account(&w.config).unwrap().data, before.data);
-}
-
-/// Only the stored admin (bytes 8..40 of the raw image) may migrate.
-#[test]
-fn migrate_config_requires_stored_admin() {
-    let mut w = setup();
-    write_legacy_config(&mut w, 100, LIVE_RESERVED);
-    let stranger = Keypair::new();
-    w.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
-    let err = migrate(&mut w, &stranger, MAX_BPS).expect_err("non-admin must be refused");
-    assert!(err.contains("Unauthorized"), "got:\n{err}");
-    assert_eq!(
-        w.svm.get_account(&w.config).unwrap().data.len(),
-        CONFIG_LEGACY_LEN,
-        "still legacy"
-    );
-
-    // The right key still works afterwards.
-    let admin = w.admin.insecure_clone();
-    migrate(&mut w, &admin, MAX_BPS).expect("admin migrates");
-    assert_eq!(read_config(&w).max_fee_bps, MAX_BPS);
-}
-
-/// The migration validates the resulting corridor: a ceiling below the
-/// legacy floor is refused, and the account is left in its legacy shape.
-#[test]
-fn migrate_config_rejects_max_below_legacy_min() {
-    let mut w = setup();
-    write_legacy_config(&mut w, 100, LIVE_RESERVED);
-    let admin = w.admin.insecure_clone();
-    let err = migrate(&mut w, &admin, 50).expect_err("max 50 < min 100");
-    assert!(err.contains("InvalidFeeBps"), "got:\n{err}");
-    assert_eq!(w.svm.get_account(&w.config).unwrap().data.len(), CONFIG_LEGACY_LEN);
-    let err = spin(&mut w, 10_000, 100, "still-legacy").expect_err("still un-migrated");
-    assert!(err.contains("AccountDidNotDeserialize"), "got:\n{err}");
-
-    let err = migrate(&mut w, &admin, MAX_FEE_BPS + 1).expect_err("max above the hard cap");
-    assert!(err.contains("InvalidFeeBps"), "got:\n{err}");
-
-    migrate(&mut w, &admin, 100).expect("max == min is a valid (degenerate) corridor");
-    assert_eq!((read_config(&w).min_fee_bps, read_config(&w).max_fee_bps), (100, 100));
-}
-
-/// Anything at the config PDA that is not a Config image is refused before
-/// any byte is touched.
-#[test]
-fn migrate_config_rejects_foreign_image() {
-    let mut w = setup();
-    // Right length, wrong discriminator (a Vault's).
-    let mut image = config_image(&w, 100, 0, 0);
-    image.truncate(CONFIG_LEGACY_LEN);
-    image[..8].copy_from_slice(Vault::DISCRIMINATOR);
-    write_config(&mut w, image);
-    let admin = w.admin.insecure_clone();
-    let err = migrate(&mut w, &admin, MAX_BPS).expect_err("foreign discriminator");
-    assert!(err.contains("InvalidConfigAccount"), "got:\n{err}");
-
-    // Too short to even hold the legacy fields.
-    let short = config_image(&w, 100, 0, 0)[..100].to_vec();
-    write_config(&mut w, short);
-    let err = migrate(&mut w, &admin, MAX_BPS).expect_err("truncated image");
-    assert!(err.contains("InvalidConfigAccount"), "got:\n{err}");
 }
 
 // ---------------------------------------------------------------------------
@@ -750,7 +584,11 @@ fn update_config_validates_corridor() {
     let err = update_fees(&mut w, &admin, Some(600), Some(400)).expect_err("min 600 > max 400");
     assert!(err.contains("InvalidFeeBps"), "got:\n{err}");
     let cfg = read_config(&w);
-    assert_eq!((cfg.min_fee_bps, cfg.max_fee_bps), (MIN_BPS, MAX_BPS), "failed updates leave it alone");
+    assert_eq!(
+        (cfg.min_fee_bps, cfg.max_fee_bps),
+        (MIN_BPS, MAX_BPS),
+        "failed updates leave it alone"
+    );
 
     // ...while a pair is validated as a whole: (600, 900) passes although
     // min 600 alone would exceed the previous max 500.
@@ -761,12 +599,10 @@ fn update_config_validates_corridor() {
     let logs = update_fees(&mut w, &admin, Some(200), Some(800)).expect("valid corridor");
     let ev: ConfigUpdated = common::decode_event(&logs).expect("ConfigUpdated emitted");
     assert_eq!(ev.admin, admin.pubkey());
-    assert_eq!(ev.gacha_wallet, w.gacha_wallet);
     assert_eq!(ev.gacha_usdc_account, w.gacha_usdc);
     assert_eq!(ev.fee_usdc_account, w.fee_usdc);
     assert_eq!((ev.min_fee_bps, ev.max_fee_bps), (200, 800));
     assert!(!ev.paused);
-    assert!(!ev.allow_buyback_delegation);
     let cfg = read_config(&w);
     assert_eq!((cfg.min_fee_bps, cfg.max_fee_bps), (200, 800));
 
@@ -811,8 +647,15 @@ fn caps_are_charged_with_amount_plus_fee() {
     let amount = 9_900;
     let fee = 100; // 1.01% of 9_900, inside [1%, 5%]
     spin(&mut w, amount, fee, "fit").expect("9_900 + 100 == per_spin_cap");
-    assert_eq!(read_vault(&w).spent_today, amount + fee, "spent_today books amount + fee");
-    assert_eq!(token_amount(&w.svm, &w.vault_usdc), 1_000 * D - amount - fee);
+    assert_eq!(
+        read_vault(&w).spent_today,
+        amount + fee,
+        "spent_today books amount + fee"
+    );
+    assert_eq!(
+        token_amount(&w.svm, &w.vault_usdc),
+        1_000 * D - amount - fee
+    );
 
     // Daily budget is 2 * cap; the fee counts there too.
     spin(&mut w, amount, fee, "fit-2").expect("second full spin fills the day exactly");
@@ -821,87 +664,78 @@ fn caps_are_charged_with_amount_plus_fee() {
     assert!(err.contains("ExceedsDailyCap"), "got:\n{err}");
 }
 
-// ---------------------------------------------------------------------------
-// 4b. migrate_config guard paths not exercised above
-// ---------------------------------------------------------------------------
-
-/// A Config-shaped image at the PDA that the program does not OWN is refused
-/// first (ownership is checked before the discriminator and the admin).
+/// Old clients must fail at dispatch, not accidentally call a different method.
 #[test]
-fn migrate_config_rejects_non_program_owned_image() {
+fn all_removed_custody_and_migration_selectors_are_rejected() {
     let mut w = setup();
-    let mut data = config_image(&w, 100, 0, LIVE_RESERVED);
-    data.truncate(CONFIG_LEGACY_LEN);
-    let lamports = w.svm.minimum_balance_for_rent_exemption(data.len());
-    w.svm
-        .set_account(
-            w.config,
-            Account { lamports, data, owner: system_program::ID, executable: false, rent_epoch: 0 },
-        )
-        .unwrap();
-    let admin = w.admin.insecure_clone();
-    let err = migrate(&mut w, &admin, MAX_BPS).expect_err("image owned by the system program");
-    assert!(err.contains("InvalidConfigAccount"), "got:\n{err}");
+    let sponsor = w.payer.insecure_clone();
+    let removed: [(&str, [u8; 8]); 9] = [
+        ("approve_buyback", [79, 220, 204, 199, 181, 27, 86, 204]),
+        ("revoke_buyback", [214, 118, 102, 101, 177, 127, 242, 141]),
+        ("clear_buyback_slot", [255, 87, 21, 11, 164, 182, 47, 20]),
+        ("buyback_pnft", [229, 155, 236, 186, 92, 43, 99, 54]),
+        ("buyback_core", [1, 108, 17, 204, 52, 40, 164, 144]),
+        ("withdraw_pnft", [208, 1, 50, 181, 217, 48, 202, 162]),
+        ("withdraw_core", [49, 97, 48, 114, 218, 116, 73, 96]),
+        ("sweep_prize_ata", [68, 115, 36, 117, 204, 209, 252, 144]),
+        ("migrate_config", [92, 131, 58, 105, 210, 154, 224, 193]),
+    ];
+    let vault_before = w.svm.get_account(&w.vault).unwrap().data;
+    let config_before = w.svm.get_account(&w.config).unwrap().data;
+    let funds_before = token_amount(&w.svm, &w.vault_usdc);
+    for (name, discriminator) in removed {
+        let ix = Instruction {
+            program_id: PROGRAM_ID,
+            accounts: vec![],
+            data: discriminator.to_vec(),
+        };
+        let err = send(&mut w, ix, &[&sponsor]).expect_err(name);
+        assert!(err.contains("InstructionFallbackNotFound"), "{name}: {err}");
+        assert!(err.contains("101"), "{name}: {err}");
+    }
+    assert_eq!(w.svm.get_account(&w.vault).unwrap().data, vault_before);
+    assert_eq!(w.svm.get_account(&w.config).unwrap().data, config_before);
+    assert_eq!(token_amount(&w.svm, &w.vault_usdc), funds_before);
 }
 
-/// The no-op path is admin-gated too: on an already-migrated Config a
-/// stranger gets Unauthorized rather than a silent Ok.
+/// Applications already handle these numeric errors; removed codes stay holes.
 #[test]
-fn migrate_config_no_op_still_requires_admin() {
-    let mut w = setup();
-    write_legacy_config(&mut w, 100, LIVE_RESERVED);
-    let admin = w.admin.insecure_clone();
-    migrate(&mut w, &admin, MAX_BPS).expect("migrate");
-    let before = w.svm.get_account(&w.config).unwrap();
-
-    let stranger = Keypair::new();
-    w.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
-    let err = migrate(&mut w, &stranger, MAX_BPS).expect_err("stranger on a migrated config");
-    assert!(err.contains("Unauthorized"), "got:\n{err}");
-    let after = w.svm.get_account(&w.config).unwrap();
-    assert_eq!(after.data, before.data, "bytes untouched");
-    assert_eq!(after.lamports, before.lamports, "lamports untouched");
+fn surviving_error_numbers_keep_their_published_values() {
+    let errors = [
+        (VaultError::Paused, 6000),
+        (VaultError::ZeroAmount, 6001),
+        (VaultError::InvalidMemo, 6002),
+        (VaultError::InvalidFeeBps, 6003),
+        (VaultError::InvalidCaps, 6004),
+        (VaultError::ExceedsPerSpinCap, 6005),
+        (VaultError::ExceedsDailyCap, 6006),
+        (VaultError::MathOverflow, 6007),
+        (VaultError::TokenAccountNotEmpty, 6015),
+        (VaultError::DelegateStillSet, 6016),
+        (VaultError::InsufficientSol, 6017),
+        (VaultError::Unauthorized, 6018),
+        (VaultError::UnsupportedMint, 6021),
+        (VaultError::FeeBelowMinimum, 6022),
+        (VaultError::FeeAboveMaximum, 6023),
+    ];
+    for (error, expected) in errors {
+        assert_eq!(u32::from(error), expected);
+    }
 }
 
-/// The 3003 window is not limited to spins: update_config cannot read a
-/// legacy image either, so `paused` is unreachable until the migration runs.
+/// If the second transfer cannot pay the fee, neither the principal nor the
+/// spending counter may remain committed.
 #[test]
-fn legacy_config_blocks_update_config_too() {
+fn insufficient_balance_for_fee_rolls_back_principal_and_spending() {
     let mut w = setup();
-    write_legacy_config(&mut w, 100, LIVE_RESERVED);
-    let admin = w.admin.insecure_clone();
-    let err = update_fees(&mut w, &admin, None, Some(MAX_BPS)).expect_err("legacy image");
-    assert!(err.contains("AccountDidNotDeserialize"), "got:\n{err}");
-    migrate(&mut w, &admin, MAX_BPS).expect("migrate");
-    update_fees(&mut w, &admin, None, Some(MAX_BPS)).expect("update_config works after migration");
-}
-
-/// When the legacy account already holds enough lamports for 176 bytes the
-/// rent top-up CPI is skipped: the config balance is untouched and the admin
-/// pays nothing beyond the transaction fee.
-#[test]
-fn migrate_config_skips_top_up_when_already_funded() {
-    let mut w = setup();
-    let mut data = config_image(&w, 100, 0, LIVE_RESERVED);
-    data.truncate(CONFIG_LEGACY_LEN);
-    let funded = w.svm.minimum_balance_for_rent_exemption(8 + Config::INIT_SPACE) + 1;
-    w.svm
-        .set_account(
-            w.config,
-            Account { lamports: funded, data, owner: PROGRAM_ID, executable: false, rent_epoch: 0 },
-        )
-        .unwrap();
-    let admin = w.admin.insecure_clone();
-    let admin_before = w.svm.get_balance(&admin.pubkey()).unwrap();
-    migrate(&mut w, &admin, MAX_BPS).expect("migrate without top-up");
-    let cfg_acc = w.svm.get_account(&w.config).unwrap();
-    assert_eq!(cfg_acc.data.len(), 8 + Config::INIT_SPACE);
-    assert_eq!(cfg_acc.lamports, funded, "no lamports moved into the config");
-    let admin_after = w.svm.get_balance(&admin.pubkey()).unwrap();
-    assert!(
-        admin_before - admin_after <= 10_000,
-        "admin paid only the tx fee, not a top-up (paid {})",
-        admin_before - admin_after
-    );
-    assert_eq!(read_config(&w).max_fee_bps, MAX_BPS);
+    let amount = 10_000u64;
+    let mut source = w.svm.get_account(&w.vault_usdc).unwrap();
+    source.data[64..72].copy_from_slice(&amount.to_le_bytes());
+    w.svm.set_account(w.vault_usdc, source).unwrap();
+    let spent_before = read_vault(&w).spent_today;
+    spin(&mut w, amount, 100, "fee-underfunded").expect_err("principal fits, fee does not");
+    assert_eq!(token_amount(&w.svm, &w.vault_usdc), amount);
+    assert_eq!(token_amount(&w.svm, &w.gacha_usdc), 0);
+    assert_eq!(token_amount(&w.svm, &w.fee_usdc), 0);
+    assert_eq!(read_vault(&w).spent_today, spent_before);
 }
